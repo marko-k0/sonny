@@ -29,11 +29,11 @@ __copyright__ = "Marko Kosmerl"
 __license__ = "gpl3"
 
 
-def setup_module(module):
+def setup_module():
     monitor.redis = fakeredis.FakeStrictRedis()
 
 
-def teardown_module(module):
+def teardown_module():
     pass
 
 

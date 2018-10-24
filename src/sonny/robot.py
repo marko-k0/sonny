@@ -91,6 +91,19 @@ class Sonny:
 
         _logger.info('sonny initialized')
 
+    @property
+    def api_alive(self):
+        alive = self.get_db_value('api_alive', str)
+        alive_ts = self.get_db_value('api_alive:timestamp', float)
+
+        return alive == 'True' and (time.time() - alive_ts) < 60
+
+    @api_alive.setter
+    def api_alive(self, alive=True):
+        self.redis.set('api_alive', alive)
+        if alive:
+            self.redis.set('api_alive:timestamp', time.time())
+
     def run(self):
         def period_sleep(check_time):
             time.sleep(max(MONITOR_PERIOD - (time.time() - check_time), 0))
@@ -105,84 +118,83 @@ class Sonny:
         )
 
         while True:
-            self.check_time = time.time()
+            check_time = time.time()
+            self.run_step()
+            period_sleep(check_time)
 
-            _logger.debug('refreshing redis inventory')
-            job = self.refresh_redis_inventory()
-            job_finished = self.wait_for_job(job, 60)
+    def run_step(self):
+        """
+        * update redis db,
+        * get suspicious hypervisors
+        * inspect suspicious hypervisors
+        * inspect instances if hypervisor is unresponsive
+        * handle dead hypervisor if instances unresponsive
+        """
+        _logger.debug('refreshing redis inventory')
+        job = self.refresh_redis_inventory()
+        job_finished = self.wait_for_job(job, 60)
 
-            if job_finished and self.api_alive:
-                _logger.debug('openstack api available')
+        if job_finished and self.api_alive:
+            _logger.debug('openstack api available')
 
-                s_hvs = self.get_suspicious_hypervisors()
-                if s_hvs:
-                    _logger.warning(f'suspicious hypervisors: {s_hvs}')
+            s_hvs = self.get_suspicious_hypervisors()
+            if s_hvs:
+                _logger.warning(f'suspicious hypervisors: {s_hvs}')
+                if len(s_hvs) > SUSPICIOUS_BACKOFF:
+                    _logger.warning(
+                        'too many suspicious hypervisors, backing off')
+                    return
 
-                    if len(s_hvs) > SUSPICIOUS_BACKOFF:
-                        _logger.warning(
-                            'too many suspicious hypervisors, backing off')
-                        period_sleep(self.check_time)
-                        continue
+                _logger.warning('scan check on on port 22, 111 and 16509')
+                done, u_hvs = self.inspect_hypervisors(s_hvs)
+                if done and u_hvs:
+                    _logger.warning(f'no response from {u_hvs}')
 
-                    _logger.warning('scan check on on port 22, 111 and 16509')
+                    d_hvs, a_hvs = self.inspect_instances(u_hvs)
+                    if d_hvs:
+                        _logger.error(f'dead hypervisors detected: {d_hvs}')
+                        self.handle_dead_hypervisor(d_hvs)
 
-                    done, u_hvs = self.inspect_hypervisors(s_hvs)
-                    if done and u_hvs:
-                        _logger.warning(f'no response from {u_hvs}')
-
-                        d_hvs, a_hvs = self.inspect_instances(u_hvs)
-                        if d_hvs:
-                            _logger.error(
-                                f'dead hypervisors detected: {d_hvs}')
-                            self.handle_dead_hypervisor(d_hvs)
-
-                        if a_hvs:
-                            _logger.error(f'some instances reachable '
-                                          'but hypervisor is not for {a_hvs}')
-                    else:
-                        _logger.info('tcp scan check shows hypervisors are ok')
+                    if a_hvs:
+                        _logger.error(f'some instances reachable '
+                                      'but hypervisor is not for {a_hvs}')
                 else:
-                    _logger.debug('no suspicious hypervisors')
-            elif not self.api_alive:
-                _logger.warning(f'openstack api not available {job.result}')
-
-            period_sleep(self.check_time)
-
-    @property
-    def api_alive(self):
-        alive = self.get_db_value('api_alive', str)
-        alive_ts = self.get_db_value('api_alive:timestamp', float)
-
-        return alive == 'True' and (time.time() - alive_ts) < 60
-
-    @api_alive.setter
-    def api_alive(self, alive=True):
-        self.redis.set('api_alive', alive)
-        if alive:
-            self.redis.set('api_alive:timestamp', time.time())
+                    _logger.info('tcp scan check shows hypervisors are ok')
+            else:
+                _logger.debug('no suspicious hypervisors')
+        elif not self.api_alive:
+            _logger.warning(f'openstack api not available {job.result}')
 
     def handle_dead_hypervisor(self, dead_hvs):
+        # XXX: multiple hvs, dry mode
         _logger.info('handling dead hypervisors')
 
+        dead_count = len(dead_hvs)
         last_recovery = self.get_db_value('recovery:timestamp', int)
-        if last_recovery and time.time()-last_recovery > COOLDOWN_PERIOD:
-            # TODO: ...
-            pass
+        last_recovery_d = time.time() - last_recovery
 
-        if len(dead_hvs) > 2:
+        if last_recovery and last_recovery_d < COOLDOWN_PERIOD:
+            _logger.warning('cooldown period still active')
             _logger.warning('not performing any action')
+            return
+
+        if dead_count > 2:
+            _logger.warrning('dead count is to high')
+            _logger.warning('not performing any action')
+            return
+
+        spare_hv = self.get_spare_hypervisor(dead_hvs[0])
+        if spare_hv:
+            _logger.info(f'spare hypervisor selected: {spare_hv}')
+            # self.recover_instances(dead_hv, spare_hv)
         else:
-            spare_hv = self.get_spare_hypervisor(dead_hvs[0])
-            if spare_hv:
-                _logger.info(f'spare hypervisor selected: {spare_hv}')
+            _logger.warning(f'no spare hypervisors!')
 
     def inspect_hypervisors(self, suspicious_hvs):
         assert isinstance(suspicious_hvs, list)
         assert len(suspicious_hvs) > 0
 
-        job = self.inspect_hosts(
-            suspicious_hvs, port_list=[22, 111, 16509]
-        )
+        job = self.inspect_hosts(suspicious_hvs, port_list=[22, 111, 16509])
         if self.wait_for_job(job, 60):
             return True, job.result
 
@@ -199,9 +211,7 @@ class Sonny:
             instances = self.get_instances(hv)
             instances_ip = [ip for _, ip in instances]
 
-            job = self.inspect_hosts(
-                instances_ip, port_list=[22]
-            )
+            job = self.inspect_hosts(instances_ip, port_list=[22])
             job.hv = hv
             running_job[job.id] = job
 
@@ -246,11 +256,10 @@ class Sonny:
 
     def get_suspicious_hypervisors(self):
         _logger.debug('checking for suspicious hypervisors')
-        tolerate_time = HEARTBEAT_PERIOD
         current_time = utcnow().timestamp()
-        hypervisor_list = []
         agents = self.get_db_value('agents', json.loads)
         hvs = self.get_db_value('hypervisors', json.loads)
+        hypervisor_list = []
 
         for hv_name, agent_dict in agents.items():
             if hv_name not in hvs:
@@ -269,7 +278,7 @@ class Sonny:
                 for t in agent_dict.values()
             ]
 
-            if all([(current_time - ats) > tolerate_time for ats in ts_list]):
+            if all([(current_time - t) > HEARTBEAT_PERIOD for t in ts_list]):
                 hypervisor_list.append(hv_name)
                 _logger.info(f'hypervisor {hv_name} is suspicious')
                 for a, t in agent_dict.items():
