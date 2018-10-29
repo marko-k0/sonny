@@ -45,11 +45,13 @@ utcnow = datetime.datetime.utcnow
 
 _logger = logging.getLogger(__name__)
 _config = configparser.ConfigParser()
+_config.read('config.ini')
 
 HEARTBEAT_PERIOD = int(_config['DEFAULT'].get('heartbeat_period', 35))
-SUSPICIOUS_BACKOFF = int(_config['DEFAULT'].get('suspicious_backoff', 5))
 COOLDOWN_PERIOD = int(_config['DEFAULT'].get('cooldown_period', 86400))
 MONITOR_PERIOD = int(_config['DEFAULT'].get('monitor_period', 60))
+SUSPICIOUS_BACKOFF = int(_config['DEFAULT'].get('suspicious_backoff', 5))
+DEAD_BACKOFF = int(_config['DEFAULT'].get('dead_backoff', 1))
 
 
 class SlackHandler(logging.StreamHandler):
@@ -76,6 +78,7 @@ class Sonny:
         self.work_queue.empty()
         for key in self.redis.keys('rq:job:*'):
             self.redis.delete(key)
+        # XXX: clean rq:scheduler:scheduled_jobs
 
         slack_token = _config['SLACK'].get('token', '')
         slack_channel = _config['SLACK'].get('channel', '')
@@ -153,11 +156,11 @@ class Sonny:
                     d_hvs, a_hvs = self.inspect_instances(u_hvs)
                     if d_hvs:
                         _logger.error(f'dead hypervisors detected: {d_hvs}')
-                        self.handle_dead_hypervisor(d_hvs)
+                        s_cnt, f_cnt = self.handle_dead_hypervisors(d_hvs)
 
                     if a_hvs:
-                        _logger.error(f'some instances reachable '
-                                      'but hypervisor is not for {a_hvs}')
+                        _logger.error(f'some or all instances reachable '
+                                      'but hypervisor is not: {a_hvs}')
                 else:
                     _logger.info('tcp scan check shows hypervisors are ok')
             else:
@@ -165,30 +168,54 @@ class Sonny:
         elif not self.api_alive:
             _logger.warning(f'openstack api not available {job.result}')
 
-    def handle_dead_hypervisor(self, dead_hvs):
-        # XXX: multiple hvs, dry mode
-        _logger.info('handling dead hypervisors')
+    def handle_dead_hypervisors(self, dead_hvs):
+        _logger.info(f'handling dead hypervisors {dead_hvs}')
 
         dead_count = len(dead_hvs)
-        last_recovery = self.get_db_value('recovery:timestamp', int)
-        last_recovery_d = time.time() - last_recovery
+        if dead_count > DEAD_BACKOFF:
+            if DEAD_BACKOFF == 0:
+                _logger.warning('running in dry mode')
+            else:
+                _logger.warning(f'dead limit ({dead_count} > {DEAD_BACKOFF})')
+            _logger.warning('not performing any action')
+            return
 
-        if last_recovery and last_recovery_d < COOLDOWN_PERIOD:
+        last_recovery = self.get_db_value('recovery:timestamp', int)
+        if last_recovery and time.time() - last_recovery < COOLDOWN_PERIOD:
             _logger.warning('cooldown period still active')
             _logger.warning('not performing any action')
             return
 
-        if dead_count > 2:
-            _logger.warrning('dead count is to high')
-            _logger.warning('not performing any action')
-            return
+        running_job = {}
+        selected_hv_set = set()
+        for dead_hv in dead_hvs:
+            spare_hv = self.get_spare_hypervisor(dead_hv, selected_hv_set)
+            if spare_hv:
+                selected_hv_set.add(spare_hv)
+                _logger.info(f'recovery job: {dead_hv} -> {spare_hv}')
+                job = self.recover_instances(dead_hv, spare_hv)
+                running_job[job.id] = job
+            else:
+                _logger.warning(f'no spare hypervisors!')
 
-        spare_hv = self.get_spare_hypervisor(dead_hvs[0])
-        if spare_hv:
-            _logger.info(f'spare hypervisor selected: {spare_hv}')
-            # self.recover_instances(dead_hv, spare_hv)
-        else:
-            _logger.warning(f'no spare hypervisors!')
+        self.redis.set('recovery:timestamp', time.time())
+        success_count = failure_count = 0
+        while running_job:
+            time.sleep(2)
+
+            for job_id, job in dict(running_job).items():
+                dead_hv, spare_hv = job.args[0]
+                if job.is_finished:
+                    _logger.info(f'success: {dead_hv} -> {spare_hv}')
+                    del running_job[job.id]
+                    success_count += 1
+                elif job.is_failed:
+                    _logger.error(f'failure: {dead_hv} -> {spare_hv}')
+                    _logger.error(job.exc_info)
+                    del running_job[job.id]
+                    failure_count += 1
+
+        return success_count, failure_count
 
     def inspect_hypervisors(self, suspicious_hvs):
         assert isinstance(suspicious_hvs, list)
@@ -302,8 +329,8 @@ class Sonny:
 
         return instance_list
 
-    def get_spare_hypervisor(self, hv_down):
-        _logger.info(f'getting spare hypervisors for {hv_down}')
+    def get_spare_hypervisor(self, hv_down, ignore_set={}):
+        _logger.info(f'getting spare hypervisor for {hv_down}')
 
         services = self.get_db_value('services', json.loads)
         aggregates = self.get_db_value('aggregates', json.loads)
@@ -327,7 +354,7 @@ class Sonny:
                     status == 'disabled', 'spare' in disables_reason.lower()]):
                 spare_hvs.append(hv)
 
-        _logger.info(f'spare candidates: {spare_hvs}')
+        _logger.info(f'spare hypervisor candidates: {spare_hvs}')
 
         for hv_name in spare_hvs:
             hv = hypervisors[hv_name]
@@ -336,6 +363,8 @@ class Sonny:
             if hv['vcpus_used'] > 0:
                 continue
             if hv['vcpus'] < hv_down_vcpus:
+                continue
+            if hv_name in ignore_set:
                 continue
 
             spare_hv = hv_name

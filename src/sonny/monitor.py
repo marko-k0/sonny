@@ -170,6 +170,7 @@ def recover_instances(dead_hv, spare_hv):
     assert DB_HOST is not None
     assert DB_USER is not None
     assert DB_PASS is not None
+    # XXX: leave dead hv as is or ipmi power off?
 
     db_conn = mysql_connect(
         host=DB_HOST, user=DB_USER, passwd=DB_PASS, db='nova')
@@ -180,7 +181,6 @@ def recover_instances(dead_hv, spare_hv):
         if server['hypervisor_hostname'] == dead_hv:
             instance_list.append(server['id'])
 
-    redis.set('recovery:timestamp', time.time())
     try:
         spare_hv = escape_string(spare_hv)
         with db_conn.cursor() as cursor:
@@ -192,8 +192,24 @@ def recover_instances(dead_hv, spare_hv):
                     where uuid={uuid}'''
                 )
             cursor.execute()
-    finally:
         db_conn.commit()
+    finally:
+        db_conn.close()
+
+    dead_service = spare_service = None
+    for svc in os_conn.compute.services():
+        if svc.host == dead_hv:
+            assert svc.status == 'enabled'
+            dead_service = svc
+        elif svc.host == spare_hv:
+            assert svc.status == 'disabled'
+            spare_service = svc
+
+    assert dead_service is not None
+    assert spare_service is not None
+    os_conn.compute.disable_service(
+     dead_service, dead_hv, 'nova-compute', f'sonny: recovery to {spare_hv}')
+    os_conn.compute.enable_service(spare_service, spare_hv, 'nova-compute')
 
     for uuid in instance_list:
         os_conn.compute.reboot_server(uuid, 'HARD')

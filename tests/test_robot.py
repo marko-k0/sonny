@@ -25,6 +25,7 @@ import fakeredis
 import json
 import pytest
 import sonny.robot as robot
+import time
 
 __author__ = "Marko Kosmerl"
 __copyright__ = "Marko Kosmerl"
@@ -45,6 +46,10 @@ def sonny():
         sonny = robot.Sonny()
 
         sonny.redis = robot.redis
+        sonny.redis.flushall()
+        sonny.api_alive = True
+
+        sonny.wait_for_job = MagicMock(return_value=True)
 
         sonny.refresh_redis_inventory = MagicMock()
         sonny.refresh_redis_inventory.return_value = MagicMock()
@@ -58,6 +63,7 @@ def sonny():
 
         sonny.recover_instances = MagicMock()
         sonny.recover_instances.return_value = MagicMock()
+        sonny.recover_instances.return_value.id = randint(1, 1000000)
         sonny.recover_instances.return_value.finished = True
 
         return sonny
@@ -107,29 +113,162 @@ def test_inspect_hypervisors(sonny):
     assert sonny.inspect_hypervisors(['hv1']) == (True, [])
 
 
-def test_inspect_instances():
+def test_inspect_instances(sonny):
+    u_hvs = ['hv42']
+    instances = [(1, '192.168.1.1'), (2, '192.168.1.2'), (3, '192.168.1.3')]
+    inspect_returns = [[], ['192.168.1.1'], [ip for _, ip in instances]]
+    inspect_instances_returns = [
+        ([], ['hv42']), ([], ['hv42']), (['hv42'], [])
+    ]
+
+    sonny.get_instances = MagicMock()
+    sonny.get_instances.return_value = MagicMock()
+    sonny.get_instances.return_value.result = instances
+    sonny.inspect_hosts.return_value.args = [[ip for _, ip in instances]]
+    for idx, ret in enumerate(inspect_returns):
+        sonny.inspect_hosts.return_value.result = ret
+        assert sonny.inspect_instances(u_hvs) == inspect_instances_returns[idx]
+
+
+def test_suspicious_hypervisors(sonny):
     assert 0 == 1
 
 
-def test_suspicious_hypervisors():
+def test_get_spare_hypervisor(sonny):
     assert 0 == 1
 
 
-def test_get_spare_hypervisor():
-    assert 0 == 1
+def test_handle_dead_hypervisors1(sonny):
+    # successfully handle 2 dead hypervisors
+    dead_hvs = ['hv10', 'hv11']
+
+    def get_spare_hv_mock(dead_hv, _):
+        return dead_hv + '9'
+
+    def recover_instances_mock(*args):
+        m = MagicMock()
+        m.id = randint(1, 1000000)
+        m.args = [dead_hvs]
+        return m
+
+    robot.DEAD_BACKOFF = 2
+    sonny.get_db_value = MagicMock(return_value=None)
+    sonny.get_spare_hypervisor = MagicMock(side_effect=get_spare_hv_mock)
+    sonny.recover_instances = MagicMock(side_effect=recover_instances_mock)
+
+    assert not sonny.redis.get('recovery:timestamp')
+    assert sonny.handle_dead_hypervisors(dead_hvs) == (2, 0)
+    assert sonny.redis.get('recovery:timestamp')
 
 
-def test_handle_dead_hypervisor():
-    assert 0 == 1
+def test_handle_dead_hypervisors2(sonny):
+    # 1 successfully handled and 1 unsuccessfully handled
+    dead_spare_hv = {'hv10': 'hv109', 'hv11': 'hv119'}
+
+    def get_spare_hv_mock(dead_hv, _):
+        return dead_spare_hv[dead_hv]
+
+    def recover_instances_mock(dead_hv, spare_hv):
+        m = MagicMock()
+        m.id = randint(1, 1000000)
+        m.args = [[dead_hv, spare_hv]]
+        if dead_hv == 'hv10':
+            m.is_finished = True
+            m.is_failed = False
+        else:
+            m.is_finished = False
+            m.is_failed = True
+        return m
+
+    robot.DEAD_BACKOFF = 2
+    sonny.get_db_value = MagicMock(return_value=None)
+    sonny.get_spare_hypervisor = MagicMock(side_effect=get_spare_hv_mock)
+    sonny.recover_instances = MagicMock(side_effect=recover_instances_mock)
+
+    assert not sonny.redis.get('recovery:timestamp')
+    assert sonny.handle_dead_hypervisors(dead_spare_hv.keys()) == (1, 1)
+    assert sonny.redis.get('recovery:timestamp')
 
 
-def test_run_step1():
-    assert 0 == 1
+def test_handle_dead_hypervisors3(sonny):
+    # dead backoff
+    sonny.get_spare_hypervisor = MagicMock()
+
+    robot.DEAD_BACKOFF = 1
+    sonny.handle_dead_hypervisors(['hv10', 'hv11'])
+    sonny.get_spare_hypervisor.assert_not_called()
 
 
-def test_run_step2():
-    assert 0 == 1
+def test_handle_dead_hypervisors4(sonny):
+    # cooldown period active
+    sonny.get_spare_hypervisor = MagicMock()
+
+    period = 300
+    robot.COOLDOWN_PERIOD = period
+    last_recovery = int(time.time()) - period + 10
+    sonny.get_db_value = MagicMock(return_value=last_recovery)
+
+    sonny.handle_dead_hypervisors(['hv10'])
+    sonny.get_spare_hypervisor.assert_not_called()
 
 
-def test_run_step3():
-    assert 0 == 1
+def test_run_step1(sonny):
+    # get_suspicious_hypervisors(), inspect_hypervisors()
+
+    sonny.get_suspicious_hypervisors = MagicMock()
+    sonny.inspect_hypervisors = MagicMock()
+
+    sonny.get_suspicious_hypervisors.return_value = []
+    sonny.run_step()
+    sonny.inspect_hypervisors.assert_not_called()
+
+    sonny.get_suspicious_hypervisors.return_value = [str(i) for i in range(99)]
+    sonny.run_step()
+    sonny.inspect_hypervisors.assert_not_called()
+
+    sonny.get_suspicious_hypervisors.return_value = ['hv42']
+    sonny.inspect_hypervisors.return_value = (True, [])
+    sonny.run_step()
+    sonny.inspect_hypervisors.assert_called_once()
+
+
+def test_run_step2(sonny):
+    # inspect_hypervisors(), inspect_instances()
+
+    sonny.get_suspicious_hypervisors = MagicMock()
+    sonny.inspect_hypervisors = MagicMock()
+    sonny.inspect_instances = MagicMock()
+
+    sonny.get_suspicious_hypervisors.return_value = ['hv42']
+    sonny.inspect_instances.return_value = ([], ['hv42'])
+
+    sonny.inspect_hypervisors.return_value = (True, [])
+    sonny.run_step()
+    sonny.inspect_instances.assert_not_called()
+
+    sonny.inspect_hypervisors.return_value = (True, ['hv42'])
+    sonny.run_step()
+    sonny.inspect_instances.assert_called_once()
+
+
+def test_run_step3(sonny):
+    # inspect_instances(), handle_dead_hypervisors()
+
+    sonny.get_suspicious_hypervisors = MagicMock()
+    sonny.inspect_hypervisors = MagicMock()
+    sonny.inspect_instances = MagicMock()
+    sonny.handle_dead_hypervisors = MagicMock()
+
+    sonny.get_suspicious_hypervisors.return_value = ['hv42']
+    sonny.inspect_hypervisors.return_value = (True, ['hv42'])
+    sonny.handle_dead_hypervisors.return_value = 1, 0
+
+    # alive
+    sonny.inspect_instances.return_value = ([], ['hv42'])
+    sonny.run_step()
+    sonny.handle_dead_hypervisors.assert_not_called()
+
+    # dead
+    sonny.inspect_instances.return_value = (['hv42'], [])
+    sonny.run_step()
+    sonny.handle_dead_hypervisors.assert_called_once()
