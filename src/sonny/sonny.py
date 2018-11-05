@@ -18,13 +18,19 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-import time
+import argparse
+import configparser
 import re
-
-from threading import Thread
+import sys
+import time
 
 from redis import StrictRedis
 from slackclient import SlackClient
+
+from sonny import __version__
+
+_config = configparser.ConfigParser()
+_config.read('config.ini')
 
 # constants
 RTM_READ_DELAY = 2  # x second delay between reading from RTM
@@ -32,15 +38,17 @@ EXAMPLE_COMMAND = "do"
 MENTION_REGEX = "^<@(|[WU].+?)>(.*)"
 
 
-class SlackBot(Thread):
+class Sonny:
 
-    def __init__(self, token, channel):
-        Thread.__init__(self)
+    def __init__(self):
+        token = _config['SLACK'].get('token')
+        channel = _config['SLACK'].get('channel')
 
         self.slack_client = SlackClient(token)
         self.redis = StrictRedis()
         self.channel = channel
         self.starterbot_id = None
+        self.last_post = time.time()
 
     def run(self):
         """
@@ -99,6 +107,8 @@ class SlackBot(Thread):
                                    text=response or default_response)
 
     def post_message(self, message):
+        # XXX: 1 post per second
+
         self.slack_client.api_call(
             "chat.postMessage", channel=self.channel, text=message)
 
@@ -113,3 +123,41 @@ class SlackBot(Thread):
         # the second group contains the remaining message
         return (matches.group(1), matches.group(2).strip()) if matches \
             else (None, None)
+
+
+def parse_args(args):
+    """Parse command line parameters
+
+    Args:
+      args ([str]): command line parameters as list of strings
+
+    Returns:
+      :obj:`argparse.Namespace`: command line parameters namespace
+    """
+    parser = argparse.ArgumentParser(
+        description="Sonny OpenStack Robot")
+    parser.add_argument(
+        '--version',
+        action='version',
+        version='sonny {ver}'.format(ver=__version__))
+    return parser.parse_args(args)
+
+
+def main(args):
+    """Main entry point allowing external calls
+
+    Args:
+      args ([str]): command line parameter list
+    """
+    args = parse_args(args)
+    Sonny().run()
+
+
+def run():
+    """Entry point for console_scripts
+    """
+    main(sys.argv[1:])
+
+
+if __name__ == "__main__":
+    run()

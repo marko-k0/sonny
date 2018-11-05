@@ -1,0 +1,25 @@
+Metadata-Version: 1.1
+Name: sonny
+Version: 0.0.post0.dev5+gc28f42e.dirty
+Summary: Sonny is a helper OpenStack robot.
+Home-page: https://github.com/redondo-mk/sonny
+Author: Marko Kosmerl
+Author-email: marko.kosmerl@gmail.com
+License: gpl3
+Description: =====
+        Sonny
+        =====
+        
+        
+        Sonny is a robot that takes care of recovering instances from a failed OpenStack hypervisor.
+        
+        virsh list --all | grep instance | awk '{print $2}' | xargs -n1 virsh undefine
+        
+        Note
+        ====
+        
+        This project is still in development phase!
+        
+Platform: Linux
+Classifier: Development Status :: 4 - Beta
+Classifier: Programming Language :: Python

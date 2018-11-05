@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-    Setup file for sonny.
+    Setup file for Sonny.
 """
 
 import sys
@@ -10,9 +10,9 @@ from setuptools import setup
 # Add here console scripts and other entry points in ini-style format
 entry_points = """
 [console_scripts]
-# script_name = sonny.module:function
-# For example:
-# fibonacci = sonny.skeleton:run
+monitor = sonny.monitor:run
+sonny = sonny.sonny:run
+ns4 = sonny.ns4:run
 """
 
 

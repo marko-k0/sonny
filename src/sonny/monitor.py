@@ -22,229 +22,375 @@ from __future__ import division, print_function, absolute_import
 
 import argparse
 import configparser
+import datetime
 import json
-import re
 import sys
 import logging
 import time
 
 from sonny import __version__
 
-from nmap import PortScanner
-from openstack import connect, connection
-from pymysql import connect as mysql_connect, escape_string
-from redis import client, StrictRedis
-from rq import Connection, Worker
+from redis import StrictRedis
+from rq import Queue
 
-__author__ = "Marko Kosmerl"
-__copyright__ = "Marko Kosmerl"
-__license__ = "gpl3"
+from sonny.ns4 import (
+    nmap_scan,
+    refresh_redis_inventory,
+    resurrect_instances)
+
+strptime = datetime.datetime.strptime
+utcnow = datetime.datetime.utcnow
 
 _logger = logging.getLogger(__name__)
-
 _config = configparser.ConfigParser()
 _config.read('config.ini')
 
-nm = PortScanner()
-
-DB_HOST = _config['MYSQL'].get('host', None)
-DB_USER = _config['MYSQL'].get('user', None)
-DB_PASS = _config['MYSQL'].get('pass', None)
-
-OS_CLOUD = _config['OPENSTACK'].get('cloud')
-
-os_conn = connect(OS_CLOUD)
-redis = StrictRedis()
-
-assert isinstance(os_conn, connection.Connection)
-assert isinstance(redis, client.StrictRedis)
+HEARTBEAT_PERIOD = int(_config['DEFAULT'].get('heartbeat_period', 40))
+COOLDOWN_PERIOD = int(_config['DEFAULT'].get('cooldown_period', 86400))
+MONITOR_PERIOD = int(_config['DEFAULT'].get('monitor_period', 60))
+SUSPICIOUS_BACKOFF = int(_config['DEFAULT'].get('suspicious_backoff', 5))
+DEAD_BACKOFF = int(_config['DEFAULT'].get('dead_backoff', 1))
 
 
-def nmap_scan(host_list, port_list=[22]):
-    assert isinstance(host_list, list)
-    assert len(host_list) > 0
+class SonnyHandler(logging.StreamHandler):
 
-    ip_to_hostname = {}
-    host_ip_list = []
-    hvs_db = json.loads(redis.get('hypervisors'))
+    def __init__(self, redis_connection, topic):
+        logging.StreamHandler.__init__(self)
+        self.redis_connection = redis_connection
+        self.topic = topic
 
-    for host in host_list:
-        if re.match(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$', host):
-            host_ip_list.append(host)
+    def emit(self, record):
+        msg = self.format(record)
+        self.redis_connection.publish(self.topic, msg)
+
+
+class Monitor:
+
+    def __init__(self):
+        self.redis = StrictRedis()
+        self.work_queue = Queue(connection=self.redis)
+        self.work_queue.empty()
+        for key in self.redis.keys('rq:job:*'):
+            self.redis.delete(key)
+
+        slack_token = _config['SLACK'].get('token', '')
+        slack_channel = _config['SLACK'].get('channel', '')
+
+        if slack_token and slack_channel:
+            sonny_handler = SonnyHandler(self.redis, 'slack')
+            _logger.addHandler(sonny_handler)
         else:
-            hv_ip = hvs_db[host]['host_ip']
-            ip_to_hostname[hv_ip] = host
-            host_ip_list.append(hv_ip)
+            _logger.info('slack config missing')
 
-    results = nm.scan(
-        ' '.join(host_ip_list),
-        ','.join(str(p) for p in port_list)
-    )
-    up_hosts = results['scan'].keys()
-    down_hosts = set(host_ip_list).difference(set(up_hosts))
+        _logger.info('sonny initialized')
 
-    down_host_list = []
-    for h in down_hosts:
-        down_host = h if h not in ip_to_hostname else ip_to_hostname[h]
-        down_host_list.append(down_host)
+    @property
+    def api_alive(self):
+        alive = self.get_db_value('api_alive', str)
+        alive_ts = self.get_db_value('api_alive:timestamp', float)
 
-    return down_host_list
+        return alive == 'True' and (time.time() - alive_ts) < 60
 
+    @api_alive.setter
+    def api_alive(self, alive=True):
+        self.redis.set('api_alive', alive)
+        if alive:
+            self.redis.set('api_alive:timestamp', time.time())
 
-def refresh_redis_inventory(update_servers=False):
-    try:
-        if update_servers:
-            update_servers_db()
-        update_hypervisors_db()
-        update_projects_db()
-        update_agents_db()
-        update_services_db()
-        update_aggregates_db()
-    except Exception as e:
-        redis.set('api_alive', False)
-        _logger.error(str(e))
-        raise e
+    def run(self):
+        def period_sleep(check_time):
+            time.sleep(max(MONITOR_PERIOD - (time.time() - check_time), 0))
 
-    redis.set('api_alive', True)
-    redis.set('api_alive:timestamp', time.time())
+        _logger.debug('sonny running')
+        self.api_alive = True
 
+        while True:
+            check_time = time.time()
+            self.run_step()
+            period_sleep(check_time)
 
-def update_aggregates_db():
-    aggregates_os = os_conn.list_aggregates()
-    aggregates = {}
-    for aggregate in aggregates_os:
-        for host in aggregate.hosts:
-            aggregates[host] = aggregate.name
+    def run_step(self):
+        """
+        * update redis db,
+        * get suspicious hypervisors
+        * inspect suspicious hypervisors
+        * inspect instances if hypervisor is unresponsive
+        * handle dead hypervisor if instances unresponsive
+        """
+        _logger.debug('refreshing redis inventory')
+        job = self.refresh_redis_inventory()
+        job_finished = self.wait_for_job(job, 90)
 
-    redis.set('aggregates', json.dumps(aggregates))
-    redis.set('aggregates:timestamp', time.time())
+        if job_finished and self.api_alive:
+            _logger.debug('openstack api available')
 
+            s_hvs = self.get_suspicious_hypervisors()
+            if s_hvs:
+                _logger.warning(f'suspicious hypervisors: {s_hvs}')
+                if len(s_hvs) > SUSPICIOUS_BACKOFF:
+                    _logger.warning(
+                        'too many suspicious hypervisors, backing off')
+                    return
 
-def update_services_db():
-    services_os = os_conn.compute.services()
-    services = {
-        s.host: s.to_dict() for s in services_os
-        if s.binary == 'nova-compute'
-    }
+                _logger.warning('scan check on on port 22, 111 and 16509')
+                done, u_hvs = self.inspect_hypervisors(s_hvs)
+                if done and u_hvs:
+                    _logger.warning(f'no response from {u_hvs}')
 
-    redis.set('services', json.dumps(services))
-    redis.set('services:timestamp', time.time())
+                    d_hvs, a_hvs = self.inspect_instances(u_hvs)
+                    if d_hvs:
+                        _logger.warning(f'dead hypervisors detected: {d_hvs}')
+                        s_cnt, f_cnt = self.handle_dead_hypervisors(d_hvs)
+                        if s_cnt and not f_cnt:
+                            _logger.info('affected instances resurrected')
 
+                    if a_hvs:
+                        _logger.warning(f'some or all instances reachable '
+                                        f'but hypervisor is not: {a_hvs}')
+                else:
+                    _logger.info('tcp scan check shows hypervisors are ok')
+            else:
+                _logger.debug('no suspicious hypervisors')
+        elif not self.api_alive:
+            if job.result:
+                _logger.warning(f'issues within the worker: {job.result}')
+            else:
+                _logger.warning(f'unknown issues within the worker')
 
-def update_projects_db():
-    projects_os = os_conn.identity.projects()
-    projects = {t.id: t.to_dict() for t in projects_os}
+    def handle_dead_hypervisors(self, dead_hvs):
+        _logger.info(f'handling dead hypervisors {dead_hvs}')
 
-    redis.set('projects', json.dumps(projects))
-    redis.set('projects:timestamp', time.time())
+        dead_count = len(dead_hvs)
+        if dead_count > DEAD_BACKOFF:
+            if DEAD_BACKOFF == 0:
+                _logger.warning('running in dry mode')
+            else:
+                _logger.warning(f'dead limit ({dead_count} > {DEAD_BACKOFF})')
+            _logger.warning('not performing any action')
+            return None, None
 
+        last_resurrection = self.get_db_value('resurrection:timestamp', float)
+        if last_resurrection and \
+           time.time() - last_resurrection < COOLDOWN_PERIOD:
+            _logger.warning('cooldown period still active')
+            _logger.warning('not performing any action')
+            return None, None
 
-def update_hypervisors_db():
-    hypervisors_os = os_conn.compute.hypervisors(True)
-    hypervisors = {hv.name: hv.to_dict() for hv in hypervisors_os}
+        running_job = {}
+        selected_hv_set = set()
+        for dead_hv in dead_hvs:
+            spare_hv = self.get_spare_hypervisor(dead_hv, selected_hv_set)
+            if spare_hv:
+                selected_hv_set.add(spare_hv)
+                _logger.info(f'resurrection job: {dead_hv} -> {spare_hv}')
+                job = self.resurrect_instances(dead_hv, spare_hv)
+                running_job[job.id] = job
+            else:
+                _logger.warning(f'no spare hypervisors!')
+                return None, None
 
-    redis.set('hypervisors', json.dumps(hypervisors))
-    redis.set('hypervisors:timestamp', time.time())
+        self.redis.set('resurrection:timestamp', time.time())
+        success_count = failure_count = 0
+        while running_job:
+            time.sleep(2)
 
+            for job_id, job in dict(running_job).items():
+                dead_hv, spare_hv = job.args
+                if job.is_finished:
+                    _logger.info(f'success: {dead_hv} -> {spare_hv}')
+                    del running_job[job.id]
+                    success_count += 1
+                elif job.is_failed:
+                    _logger.warning(f'failure: {dead_hv} -> {spare_hv}')
+                    _logger.error(job.exc_info)
+                    del running_job[job.id]
+                    failure_count += 1
 
-def update_agents_db():
-    agents_os = [
-        (a.host, a.binary, a.last_heartbeat_at)
-        for a in os_conn.network.agents()
-    ]
-    agents = {}
-    for host, binary, heartbeat in agents_os:
-        agents.setdefault(host, {})[binary] = heartbeat
+        return success_count, failure_count
 
-    redis.set('agents', json.dumps(agents))
-    redis.set('agents:timestamp', time.time())
+    def inspect_hypervisors(self, suspicious_hvs):
+        assert isinstance(suspicious_hvs, list)
+        assert len(suspicious_hvs) > 0
 
+        job = self.inspect_hosts(suspicious_hvs, port_list=[22, 111, 16509])
+        if self.wait_for_job(job, 60):
+            return True, job.result
 
-def update_servers_db():
-    servers_os = os_conn.compute.servers(all_tenants=True)
-    servers = {}
+        return False, []
 
-    for server in servers_os:
-        servers[server.id] = server.to_dict()
+    def inspect_instances(self, unreachable_hvs):
+        assert isinstance(unreachable_hvs, list)
+        assert len(unreachable_hvs) > 0
 
-    redis.set('servers', json.dumps(servers))
-    redis.set('servers:timestamp', time.time())
+        job = self.refresh_redis_inventory(True)
+        self.wait_for_job(job, 90)
 
+        running_job = {}
+        dead_hvs, alive_hvs = [], []
 
-def resurrect_instances(dead_hv, spare_hv, update_db=True):
-    assert DB_HOST is not None
-    assert DB_USER is not None
-    assert DB_PASS is not None
-    assert dead_hv != spare_hv
+        for hv in unreachable_hvs:
+            instances = self.get_instances(hv)
+            instances_ip = [ip for _, ip in instances]
+            if not instances_ip:
+                _logger.info(f'no instances on {hv}')
+                continue
 
-    dead_service = spare_service = None
-    for svc in os_conn.compute.services():
-        if svc.host == dead_hv:
-            dead_service = svc
-        elif svc.host == spare_hv:
-            spare_service = svc
-            assert svc.status == 'disabled'
+            job = self.inspect_hosts(instances_ip, port_list=[22])
+            job.hv = hv
+            running_job[job.id] = job
 
-    assert dead_service is not None
-    assert spare_service is not None
-    assert spare_service.state == 'up'
-    assert spare_service.zone == dead_service.zone
-    assert 'spare' in spare_service.disables_reason.lower()
+        while running_job:
+            time.sleep(1)
 
-    if update_db:
-        _logger.info('updating redis database')
-        refresh_redis_inventory()
-        update_servers_db()
+            for job_id, job in dict(running_job).items():
+                if job.is_finished:
+                    all_ips = job.args[0]
+                    dead_ips = job.result
+                    if len(dead_ips) == len(all_ips):
+                        dead_hvs.append(job.hv)
+                    else:
+                        alive_hvs.append(job.hv)
+                    del running_job[job.id]
+                elif job.is_failed:
+                    alive_hvs.append(job.hv)
+                    del running_job[job.id]
 
-    _logger.info(f'verifying that {dead_hv} is dead')
-    if not nmap_scan([dead_hv], [22, 111, 16509]):
-        raise Exception(f'hypervisor {dead_hv} does not seem to be dead!')
+        return dead_hvs, alive_hvs
 
-    instance_list = []
-    servers = json.loads(redis.get('servers'))
-    for _, server in servers.items():
-        if server['hypervisor_hostname'] == spare_hv:
-            raise Exception(f'spare hypervisor {spare_hv} has vms assigned!')
-        if server['hypervisor_hostname'] == dead_hv:
-            instance_list.append(server['id'])
+    def get_db_value(self, key, value_type=None):
+        value = self.redis.get(key)
 
-    if not instance_list:
-        _logger.warning(f'{dead_hv} does not run any instances')
-        return
+        if value and value_type is str:
+            return value.decode('utf-8')
+        elif value and value_type:
+            return value_type(value)
+        elif value:
+            return value
+        else:
+            return None
 
-    _logger.info('updating database records')
-    db_conn = mysql_connect(
-        host=DB_HOST, user=DB_USER, passwd=DB_PASS, db='nova')
-    try:
-        spare_hv = escape_string(spare_hv)
-        with db_conn.cursor() as cursor:
-            for uuid in instance_list:
-                uuid = escape_string(uuid)
-                query = \
-                    f'''update instances set
-                    host = "{spare_hv}", node = "{spare_hv}"
-                    where uuid="{uuid}"'''
-                _logger.debug(query)
-                cursor.execute(query)
-        db_conn.commit()
-    finally:
-        db_conn.close()
+    def wait_for_job(self, job, timeout=30):
+        start_time = time.time()
+        while not (job.is_finished or job.is_failed):
+            time.sleep(1)
+            if time.time() - start_time > timeout:
+                return False
 
-    _logger.info('updating servers inventory db')
-    update_servers_db()
+        return job.is_finished
 
-    _logger.info(f'disabling nova on {dead_hv}, enabling nova on {spare_hv}')
-    os_conn.compute.disable_service(dead_service, dead_hv, 'nova-compute',
-                                    f'sonny resurrection on {spare_hv}')
-    os_conn.compute.enable_service(spare_service, spare_hv, 'nova-compute')
+    def get_suspicious_hypervisors(self):
+        _logger.debug('checking for suspicious hypervisors')
+        current_time = utcnow().timestamp()
+        agents = self.get_db_value('agents', json.loads)
+        hvs = self.get_db_value('hypervisors', json.loads)
+        hypervisor_list = []
 
-    for uuid in instance_list:
-        _logger.info(f'hard rebooting instance {uuid}')
-        os_conn.compute.reboot_server(uuid, 'HARD')
-        for ifce in os_conn.compute.server_interfaces(uuid):
-            _logger.info(f'updating port binding on {ifce.port_id}')
-            port = os_conn.get_port(ifce.port_id)
-            os_conn.network.update_port(port, **{'binding:host_id': spare_hv})
+        for hv_name, agent_dict in agents.items():
+            if hv_name not in hvs:
+                continue
+
+            hv = hvs[hv_name]
+            if hv['state'] == 'down' and \
+               hv['service_details']['disabled_reason'] and \
+               'sonny' in hv['service_details']['disabled_reason']:
+                _logger.debug(f'{hv_name} is down but alredy handled')
+                continue
+            elif hv['status'] == 'disabled' and hv['running_vms'] == 0:
+                _logger.debug(
+                    f'ignoring {hv_name} (disabled and 0 running vms)')
+                continue
+            elif hv['status'] == 'disabled' and hv['running_vms'] > 0:
+                r_vms = hv['running_vms']
+                _logger.warning(
+                    f'{hv_name} is disabled and running {r_vms} instances!')
+            elif hv['running_vms'] == 0:
+                _logger.debug(f'ignoring {hv_name} (0 running vms)')
+                continue
+
+            ts_list = [
+                strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+                for t in agent_dict.values()
+            ]
+
+            if all([(current_time - t) > HEARTBEAT_PERIOD for t in ts_list]):
+                hypervisor_list.append(hv_name)
+                _logger.info(f'hypervisor {hv_name} is suspicious')
+                for a, t in agent_dict.items():
+                    tt = strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
+                    tt_d = int(current_time - tt)
+                    _logger.debug(f'last heartbeat of {a} was {tt_d} sec ago')
+
+        return hypervisor_list
+
+    def get_instances(self, hypervisor):
+        _logger.debug(f'checking for affected instances on {hypervisor}')
+        servers = self.get_db_value('servers', json.loads)
+        instance_list = []
+
+        for _, server in servers.items():
+            if server['hypervisor_hostname'] == hypervisor:
+                if 'ext-net' in server['addresses']:
+                    instance_name = server['name']
+                    instance_ip = server['addresses']['ext-net'][0]['addr']
+                    instance_list.append((instance_name, instance_ip))
+
+        return instance_list
+
+    def get_spare_hypervisor(self, hv_down, ignore_set={}):
+        _logger.info(f'getting spare hypervisor for {hv_down}')
+
+        services = self.get_db_value('services', json.loads)
+        aggregates = self.get_db_value('aggregates', json.loads)
+        hypervisors = self.get_db_value('hypervisors', json.loads)
+
+        hv_down_az = services[hv_down]['zone']
+        hv_down_vcpus = hypervisors[hv_down]['vcpus']
+        hv_down_aggregate = aggregates[hv_down]
+
+        _logger.info(f'az: {hv_down_az}, aggregate: {hv_down_aggregate}')
+
+        spare_hv = None
+        spare_hvs = []
+        for hv in services:
+            state = services[hv]['state']
+            status = services[hv]['status']
+            disables_reason = str(services[hv]['disables_reason'])
+            zone = services[hv]['zone']
+
+            if all([zone == hv_down_az, state == 'up',
+                    status == 'disabled', 'spare' in disables_reason.lower()]):
+                spare_hvs.append(hv)
+
+        _logger.info(f'spare hypervisor candidates: {spare_hvs}')
+
+        for hv_name in spare_hvs:
+            hv = hypervisors[hv_name]
+            if aggregates[hv_name] != hv_down_aggregate:
+                continue
+            if hv['vcpus_used'] > 0:
+                continue
+            if hv['vcpus'] < hv_down_vcpus:
+                continue
+            if hv_name in ignore_set:
+                continue
+
+            spare_hv = hv_name
+            break
+
+        return spare_hv
+
+    def resurrect_instances(self, dead_hv, spare_hv):
+        return self.work_queue.enqueue(resurrect_instances, dead_hv, spare_hv)
+
+    def inspect_hosts(self, hv_name_list, port_list=[22]):
+        return self.work_queue.enqueue(nmap_scan, hv_name_list, port_list)
+
+    def refresh_redis_inventory(self, update_servers=False):
+        last_servers_update = self.get_db_value('servers:timestamp', float)
+        if not last_servers_update or time.time() - last_servers_update > 600:
+            update_servers = True
+
+        return self.work_queue.enqueue(refresh_redis_inventory, update_servers)
 
 
 def parse_args(args):
@@ -257,7 +403,7 @@ def parse_args(args):
       :obj:`argparse.Namespace`: command line parameters namespace
     """
     parser = argparse.ArgumentParser(
-        description="Workers for Sonny")
+        description="OpenStack Monitor")
     parser.add_argument(
         '--version',
         action='version',
@@ -276,16 +422,15 @@ def parse_args(args):
         help="set loglevel to DEBUG",
         action='store_const',
         const=logging.DEBUG)
-
-    recover_group = parser.add_argument_group(title='Resurrect Instances')
-    recover_group.add_argument(
-        '-d',
-        '--dead-hypervisor')
-    recover_group.add_argument(
-        '-s',
-        '--spare-hypervisor')
-
     return parser.parse_args(args)
+
+
+def read_and_validate_config(config_file='config.ini'):
+    _config.read(config_file)
+
+    for section in ['SLACK', 'REDIS', 'MYSQL', 'OPENSTACK']:
+        if section not in _config.sections():
+            raise Exception('config issue')
 
 
 def setup_logging(loglevel):
@@ -305,28 +450,12 @@ def main(args):
     Args:
       args ([str]): command line parameter list
     """
-
     args = parse_args(args)
+    read_and_validate_config()
     setup_logging(args.loglevel)
+    _logger.debug("starting sonny")
 
-    if args.dead_hypervisor:
-        if not args.spare_hypervisor:
-            print('Spare hypervisor required!')
-            sys.exit(1)
-
-        resurrect_instances(
-            args.dead_hypervisor,
-            args.spare_hypervisor)
-
-        return
-
-    _logger.debug("started monitor")
-    with Connection():
-        # qs = sys.argv[1:] or ['default']
-        qs = ['default']
-
-        w = Worker(qs)
-        w.work()
+    Monitor().run()
 
 
 def run():
