@@ -124,7 +124,7 @@ def test_inspect_instances(sonny):
     sonny.get_instances = MagicMock()
     sonny.get_instances.return_value = MagicMock()
     sonny.get_instances.return_value.result = instances
-    sonny.inspect_hosts.return_value.args = [[ip for _, ip in instances]]
+    sonny.inspect_hosts.return_value.args = [ip for _, ip in instances]
     for idx, ret in enumerate(inspect_returns):
         sonny.inspect_hosts.return_value.result = ret
         assert sonny.inspect_instances(u_hvs) == inspect_instances_returns[idx]
@@ -145,20 +145,20 @@ def test_handle_dead_hypervisors1(sonny):
     def get_spare_hv_mock(dead_hv, _):
         return dead_hv + '9'
 
-    def recover_instances_mock(*args):
+    def resurrect_instances_mock(*args):
         m = MagicMock()
         m.id = randint(1, 1000000)
-        m.args = [dead_hvs]
+        m.args = dead_hvs
         return m
 
     robot.DEAD_BACKOFF = 2
     sonny.get_db_value = MagicMock(return_value=None)
     sonny.get_spare_hypervisor = MagicMock(side_effect=get_spare_hv_mock)
-    sonny.recover_instances = MagicMock(side_effect=recover_instances_mock)
+    sonny.resurrect_instances = MagicMock(side_effect=resurrect_instances_mock)
 
-    assert not sonny.redis.get('recovery:timestamp')
+    assert not sonny.redis.get('resurrection:timestamp')
     assert sonny.handle_dead_hypervisors(dead_hvs) == (2, 0)
-    assert sonny.redis.get('recovery:timestamp')
+    assert sonny.redis.get('resurrection:timestamp')
 
 
 def test_handle_dead_hypervisors2(sonny):
@@ -168,10 +168,10 @@ def test_handle_dead_hypervisors2(sonny):
     def get_spare_hv_mock(dead_hv, _):
         return dead_spare_hv[dead_hv]
 
-    def recover_instances_mock(dead_hv, spare_hv):
+    def resurrect_instances_mock(dead_hv, spare_hv):
         m = MagicMock()
         m.id = randint(1, 1000000)
-        m.args = [[dead_hv, spare_hv]]
+        m.args = [dead_hv, spare_hv]
         if dead_hv == 'hv10':
             m.is_finished = True
             m.is_failed = False
@@ -183,11 +183,11 @@ def test_handle_dead_hypervisors2(sonny):
     robot.DEAD_BACKOFF = 2
     sonny.get_db_value = MagicMock(return_value=None)
     sonny.get_spare_hypervisor = MagicMock(side_effect=get_spare_hv_mock)
-    sonny.recover_instances = MagicMock(side_effect=recover_instances_mock)
+    sonny.resurrect_instances = MagicMock(side_effect=resurrect_instances_mock)
 
-    assert not sonny.redis.get('recovery:timestamp')
+    assert not sonny.redis.get('resurrection:timestamp')
     assert sonny.handle_dead_hypervisors(dead_spare_hv.keys()) == (1, 1)
-    assert sonny.redis.get('recovery:timestamp')
+    assert sonny.redis.get('resurrection:timestamp')
 
 
 def test_handle_dead_hypervisors3(sonny):

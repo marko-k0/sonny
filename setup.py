@@ -2,10 +2,6 @@
 # -*- coding: utf-8 -*-
 """
     Setup file for sonny.
-
-    This file was generated with PyScaffold 3.0.3.
-    PyScaffold helps you to put up the scaffold of your new Python project.
-    Learn more under: http://pyscaffold.org/
 """
 
 import sys

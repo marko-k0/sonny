@@ -31,9 +31,9 @@ import time
 from sonny import __version__
 
 from nmap import PortScanner
-from openstack import connect
+from openstack import connect, connection
 from pymysql import connect as mysql_connect, escape_string
-from redis import StrictRedis
+from redis import client, StrictRedis
 from rq import Connection, Worker
 
 __author__ = "Marko Kosmerl"
@@ -51,10 +51,13 @@ DB_HOST = _config['MYSQL'].get('host', None)
 DB_USER = _config['MYSQL'].get('user', None)
 DB_PASS = _config['MYSQL'].get('pass', None)
 
-OS_CLOUD = _config['OS'].get('cloud', '')
+OS_CLOUD = _config['OPENSTACK'].get('cloud')
 
 os_conn = connect(OS_CLOUD)
 redis = StrictRedis()
+
+assert isinstance(os_conn, connection.Connection)
+assert isinstance(redis, client.StrictRedis)
 
 
 def nmap_scan(host_list, port_list=[22]):
@@ -88,8 +91,10 @@ def nmap_scan(host_list, port_list=[22]):
     return down_host_list
 
 
-def refresh_redis_inventory():
+def refresh_redis_inventory(update_servers=False):
     try:
+        if update_servers:
+            update_servers_db()
         update_hypervisors_db()
         update_projects_db()
         update_agents_db()
@@ -166,56 +171,80 @@ def update_servers_db():
     redis.set('servers:timestamp', time.time())
 
 
-def recover_instances(dead_hv, spare_hv):
+def resurrect_instances(dead_hv, spare_hv, update_db=True):
     assert DB_HOST is not None
     assert DB_USER is not None
     assert DB_PASS is not None
-    # XXX: leave dead hv as is or ipmi power off?
+    assert dead_hv != spare_hv
 
-    db_conn = mysql_connect(
-        host=DB_HOST, user=DB_USER, passwd=DB_PASS, db='nova')
-    servers = json.loads(redis.get('servers'))
+    dead_service = spare_service = None
+    for svc in os_conn.compute.services():
+        if svc.host == dead_hv:
+            dead_service = svc
+        elif svc.host == spare_hv:
+            spare_service = svc
+            assert svc.status == 'disabled'
+
+    assert dead_service is not None
+    assert spare_service is not None
+    assert spare_service.state == 'up'
+    assert spare_service.zone == dead_service.zone
+    assert 'spare' in spare_service.disables_reason.lower()
+
+    if update_db:
+        _logger.info('updating redis database')
+        refresh_redis_inventory()
+        update_servers_db()
+
+    _logger.info(f'verifying that {dead_hv} is dead')
+    if not nmap_scan([dead_hv], [22, 111, 16509]):
+        raise Exception(f'hypervisor {dead_hv} does not seem to be dead!')
+
     instance_list = []
-
+    servers = json.loads(redis.get('servers'))
     for _, server in servers.items():
+        if server['hypervisor_hostname'] == spare_hv:
+            raise Exception(f'spare hypervisor {spare_hv} has vms assigned!')
         if server['hypervisor_hostname'] == dead_hv:
             instance_list.append(server['id'])
 
+    if not instance_list:
+        _logger.warning(f'{dead_hv} does not run any instances')
+        return
+
+    _logger.info('updating database records')
+    db_conn = mysql_connect(
+        host=DB_HOST, user=DB_USER, passwd=DB_PASS, db='nova')
     try:
         spare_hv = escape_string(spare_hv)
         with db_conn.cursor() as cursor:
             for uuid in instance_list:
                 uuid = escape_string(uuid)
-                cursor.execute(
+                query = \
                     f'''update instances set
-                    host = {spare_hv}, node = {spare_hv}
-                    where uuid={uuid}'''
-                )
-            cursor.execute()
+                    host = "{spare_hv}", node = "{spare_hv}"
+                    where uuid="{uuid}"'''
+                _logger.debug(query)
+                cursor.execute(query)
         db_conn.commit()
     finally:
         db_conn.close()
 
-    dead_service = spare_service = None
-    for svc in os_conn.compute.services():
-        if svc.host == dead_hv:
-            assert svc.status == 'enabled'
-            dead_service = svc
-        elif svc.host == spare_hv:
-            assert svc.status == 'disabled'
-            spare_service = svc
+    _logger.info('updating servers inventory db')
+    update_servers_db()
 
-    assert dead_service is not None
-    assert spare_service is not None
-    os_conn.compute.disable_service(
-     dead_service, dead_hv, 'nova-compute', f'sonny: recovery to {spare_hv}')
+    _logger.info(f'disabling nova on {dead_hv}, enabling nova on {spare_hv}')
+    os_conn.compute.disable_service(dead_service, dead_hv, 'nova-compute',
+                                    f'sonny resurrection on {spare_hv}')
     os_conn.compute.enable_service(spare_service, spare_hv, 'nova-compute')
 
     for uuid in instance_list:
+        _logger.info(f'hard rebooting instance {uuid}')
         os_conn.compute.reboot_server(uuid, 'HARD')
         for ifce in os_conn.compute.server_interfaces(uuid):
-            os_conn.update_port(ifce.port_id,
-                                {'port': {'binding:host_id': spare_hv}})
+            _logger.info(f'updating port binding on {ifce.port_id}')
+            port = os_conn.get_port(ifce.port_id)
+            os_conn.network.update_port(port, **{'binding:host_id': spare_hv})
 
 
 def parse_args(args):
@@ -247,6 +276,15 @@ def parse_args(args):
         help="set loglevel to DEBUG",
         action='store_const',
         const=logging.DEBUG)
+
+    recover_group = parser.add_argument_group(title='Resurrect Instances')
+    recover_group.add_argument(
+        '-d',
+        '--dead-hypervisor')
+    recover_group.add_argument(
+        '-s',
+        '--spare-hypervisor')
+
     return parser.parse_args(args)
 
 
@@ -270,8 +308,19 @@ def main(args):
 
     args = parse_args(args)
     setup_logging(args.loglevel)
-    _logger.debug("started monitor")
 
+    if args.dead_hypervisor:
+        if not args.spare_hypervisor:
+            print('Spare hypervisor required!')
+            sys.exit(1)
+
+        resurrect_instances(
+            args.dead_hypervisor,
+            args.spare_hypervisor)
+
+        return
+
+    _logger.debug("started monitor")
     with Connection():
         # qs = sys.argv[1:] or ['default']
         qs = ['default']

@@ -32,12 +32,11 @@ from sonny import __version__
 
 from redis import StrictRedis
 from rq import Queue
-from rq_scheduler import Scheduler
 
 from sonny.monitor import (
     nmap_scan,
     refresh_redis_inventory,
-    update_servers_db)
+    resurrect_instances)
 from sonny.slack import SlackBot
 
 strptime = datetime.datetime.strptime
@@ -47,11 +46,12 @@ _logger = logging.getLogger(__name__)
 _config = configparser.ConfigParser()
 _config.read('config.ini')
 
-HEARTBEAT_PERIOD = int(_config['DEFAULT'].get('heartbeat_period', 35))
+HEARTBEAT_PERIOD = int(_config['DEFAULT'].get('heartbeat_period', 40))
 COOLDOWN_PERIOD = int(_config['DEFAULT'].get('cooldown_period', 86400))
 MONITOR_PERIOD = int(_config['DEFAULT'].get('monitor_period', 60))
 SUSPICIOUS_BACKOFF = int(_config['DEFAULT'].get('suspicious_backoff', 5))
 DEAD_BACKOFF = int(_config['DEFAULT'].get('dead_backoff', 1))
+LOG_LEVEL = _config['DEFAULT'].get('loglevel', logging.INFO)
 
 
 class SlackHandler(logging.StreamHandler):
@@ -71,14 +71,9 @@ class Sonny:
     def __init__(self):
         self.redis = StrictRedis()
         self.work_queue = Queue(connection=self.redis)
-        self.scheduler = Scheduler(
-            connection=self.redis,
-            queue=self.work_queue)
-
         self.work_queue.empty()
         for key in self.redis.keys('rq:job:*'):
             self.redis.delete(key)
-        # XXX: clean rq:scheduler:scheduled_jobs
 
         slack_token = _config['SLACK'].get('token', '')
         slack_channel = _config['SLACK'].get('channel', '')
@@ -113,12 +108,6 @@ class Sonny:
 
         _logger.debug('sonny running')
         self.api_alive = True
-        self.scheduler.schedule(
-            scheduled_time=utcnow(),
-            func=update_servers_db,
-            interval=180,
-            repeat=None
-        )
 
         while True:
             check_time = time.time()
@@ -135,7 +124,7 @@ class Sonny:
         """
         _logger.debug('refreshing redis inventory')
         job = self.refresh_redis_inventory()
-        job_finished = self.wait_for_job(job, 60)
+        job_finished = self.wait_for_job(job, 90)
 
         if job_finished and self.api_alive:
             _logger.debug('openstack api available')
@@ -155,18 +144,23 @@ class Sonny:
 
                     d_hvs, a_hvs = self.inspect_instances(u_hvs)
                     if d_hvs:
-                        _logger.error(f'dead hypervisors detected: {d_hvs}')
+                        _logger.warning(f'dead hypervisors detected: {d_hvs}')
                         s_cnt, f_cnt = self.handle_dead_hypervisors(d_hvs)
+                        if s_cnt and not f_cnt:
+                            _logger.info('affected instances resurrected')
 
                     if a_hvs:
-                        _logger.error(f'some or all instances reachable '
-                                      'but hypervisor is not: {a_hvs}')
+                        _logger.warning(f'some or all instances reachable '
+                                        f'but hypervisor is not: {a_hvs}')
                 else:
                     _logger.info('tcp scan check shows hypervisors are ok')
             else:
                 _logger.debug('no suspicious hypervisors')
         elif not self.api_alive:
-            _logger.warning(f'openstack api not available {job.result}')
+            if job.result:
+                _logger.warning(f'issues within the worker: {job.result}')
+            else:
+                _logger.warning(f'unknown issues within the worker')
 
     def handle_dead_hypervisors(self, dead_hvs):
         _logger.info(f'handling dead hypervisors {dead_hvs}')
@@ -178,13 +172,14 @@ class Sonny:
             else:
                 _logger.warning(f'dead limit ({dead_count} > {DEAD_BACKOFF})')
             _logger.warning('not performing any action')
-            return
+            return None, None
 
-        last_recovery = self.get_db_value('recovery:timestamp', int)
-        if last_recovery and time.time() - last_recovery < COOLDOWN_PERIOD:
+        last_resurrection = self.get_db_value('resurrection:timestamp', float)
+        if last_resurrection and \
+           time.time() - last_resurrection < COOLDOWN_PERIOD:
             _logger.warning('cooldown period still active')
             _logger.warning('not performing any action')
-            return
+            return None, None
 
         running_job = {}
         selected_hv_set = set()
@@ -192,25 +187,26 @@ class Sonny:
             spare_hv = self.get_spare_hypervisor(dead_hv, selected_hv_set)
             if spare_hv:
                 selected_hv_set.add(spare_hv)
-                _logger.info(f'recovery job: {dead_hv} -> {spare_hv}')
-                job = self.recover_instances(dead_hv, spare_hv)
+                _logger.info(f'resurrection job: {dead_hv} -> {spare_hv}')
+                job = self.resurrect_instances(dead_hv, spare_hv)
                 running_job[job.id] = job
             else:
                 _logger.warning(f'no spare hypervisors!')
+                return None, None
 
-        self.redis.set('recovery:timestamp', time.time())
+        self.redis.set('resurrection:timestamp', time.time())
         success_count = failure_count = 0
         while running_job:
             time.sleep(2)
 
             for job_id, job in dict(running_job).items():
-                dead_hv, spare_hv = job.args[0]
+                dead_hv, spare_hv = job.args
                 if job.is_finished:
                     _logger.info(f'success: {dead_hv} -> {spare_hv}')
                     del running_job[job.id]
                     success_count += 1
                 elif job.is_failed:
-                    _logger.error(f'failure: {dead_hv} -> {spare_hv}')
+                    _logger.warning(f'failure: {dead_hv} -> {spare_hv}')
                     _logger.error(job.exc_info)
                     del running_job[job.id]
                     failure_count += 1
@@ -231,12 +227,18 @@ class Sonny:
         assert isinstance(unreachable_hvs, list)
         assert len(unreachable_hvs) > 0
 
+        job = self.refresh_redis_inventory(True)
+        self.wait_for_job(job, 90)
+
         running_job = {}
         dead_hvs, alive_hvs = [], []
 
         for hv in unreachable_hvs:
             instances = self.get_instances(hv)
             instances_ip = [ip for _, ip in instances]
+            if not instances_ip:
+                _logger.info(f'no instances on {hv}')
+                continue
 
             job = self.inspect_hosts(instances_ip, port_list=[22])
             job.hv = hv
@@ -293,12 +295,22 @@ class Sonny:
                 continue
 
             hv = hvs[hv_name]
-            if hv['status'] == 'disabled' and hv['running_vms'] == 0:
+            if hv['state'] == 'down' and \
+               hv['service_details']['disabled_reason'] and \
+               'sonny' in hv['service_details']['disabled_reason']:
+                _logger.debug(f'{hv_name} is down but alredy handled')
                 continue
-            if hv['status'] == 'disabled' and hv['running_vms'] > 0:
+            elif hv['status'] == 'disabled' and hv['running_vms'] == 0:
+                _logger.debug(
+                    f'ignoring {hv_name} (disabled and 0 running vms)')
+                continue
+            elif hv['status'] == 'disabled' and hv['running_vms'] > 0:
                 r_vms = hv['running_vms']
                 _logger.warning(
                     f'{hv_name} is disabled and running {r_vms} instances!')
+            elif hv['running_vms'] == 0:
+                _logger.debug(f'ignoring {hv_name} (0 running vms)')
+                continue
 
             ts_list = [
                 strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
@@ -372,14 +384,18 @@ class Sonny:
 
         return spare_hv
 
-    def recover_instances(self, dead_hv, spare_hv):
-        return self.work_queue.enqueue(dead_hv, spare_hv)
+    def resurrect_instances(self, dead_hv, spare_hv):
+        return self.work_queue.enqueue(resurrect_instances, dead_hv, spare_hv)
 
     def inspect_hosts(self, hv_name_list, port_list=[22]):
         return self.work_queue.enqueue(nmap_scan, hv_name_list, port_list)
 
-    def refresh_redis_inventory(self):
-        return self.work_queue.enqueue(refresh_redis_inventory)
+    def refresh_redis_inventory(self, update_servers=False):
+        last_servers_update = self.get_db_value('servers:timestamp', float)
+        if not last_servers_update or time.time() - last_servers_update > 600:
+            update_servers = True
+
+        return self.work_queue.enqueue(refresh_redis_inventory, update_servers)
 
 
 def parse_args(args):
@@ -403,21 +419,21 @@ def parse_args(args):
         dest="loglevel",
         help="set loglevel to INFO",
         action='store_const',
-        const=logging.INFO)
+        const=LOG_LEVEL)
     parser.add_argument(
         '-vv',
         '--very-verbose',
         dest="loglevel",
         help="set loglevel to DEBUG",
         action='store_const',
-        const=logging.DEBUG)
+        const=LOG_LEVEL)
     return parser.parse_args(args)
 
 
 def read_and_validate_config(config_file='config.ini'):
     _config.read(config_file)
 
-    for section in ['SLACK', 'REDIS']:
+    for section in ['SLACK', 'REDIS', 'MYSQL', 'OPENSTACK']:
         if section not in _config.sections():
             raise Exception('config issue')
 
