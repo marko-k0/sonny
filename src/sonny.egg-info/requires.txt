@@ -1,8 +1,0 @@
-redis
-rq
-rq-scheduler
-python-nmap
-openstacksdk
-requests
-slackclient
-pymysql

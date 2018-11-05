@@ -1,5 +1,0 @@
-
-[console_scripts]
-monitor = sonny.monitor:run
-sonny = sonny.sonny:run
-ns4 = sonny.ns4:run
