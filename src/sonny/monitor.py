@@ -21,87 +21,94 @@
 from __future__ import division, print_function, absolute_import
 
 import argparse
-import configparser
 import datetime
 import json
 import sys
 import logging
 import time
 
-from sonny import __version__
-
-from redis import StrictRedis
 from rq import Queue
 
+from sonny import __version__
 from sonny.ns4 import (
     nmap_scan,
     refresh_redis_inventory,
     resurrect_instances)
+from sonny.common.config import (
+    COOLDOWN_PERIOD,
+    DEAD_BACKOFF,
+    HEARTBEAT_PERIOD,
+    MONITOR_PERIOD,
+    SUSPICIOUS_BACKOFF
+)
+from sonny.common.config import (
+    CLOUD,
+    SLACK_TOKEN,
+    SLACK_CHANNEL
+)
+from sonny.common.redis import (
+    Redis,
+    redis_db,
+    redis_value
+)
+
+assert CLOUD is not None
 
 strptime = datetime.datetime.strptime
 utcnow = datetime.datetime.utcnow
 
 _logger = logging.getLogger(__name__)
-_config = configparser.ConfigParser()
-_config.read('config.ini')
 
-HEARTBEAT_PERIOD = int(_config['DEFAULT'].get('heartbeat_period', 40))
-COOLDOWN_PERIOD = int(_config['DEFAULT'].get('cooldown_period', 86400))
-MONITOR_PERIOD = int(_config['DEFAULT'].get('monitor_period', 60))
-SUSPICIOUS_BACKOFF = int(_config['DEFAULT'].get('suspicious_backoff', 5))
-DEAD_BACKOFF = int(_config['DEFAULT'].get('dead_backoff', 1))
+# REDIS
+redis = Redis(CLOUD)
+work_queue = Queue(connection=redis)
 
 
 class SonnyHandler(logging.StreamHandler):
 
-    def __init__(self, redis_connection, topic):
+    def __init__(self, topic):
         logging.StreamHandler.__init__(self)
-        self.redis_connection = redis_connection
         self.topic = topic
 
     def emit(self, record):
         msg = self.format(record)
-        self.redis_connection.publish(self.topic, msg)
+        redis.publish(self.topic, msg)
 
 
 class Monitor:
 
     def __init__(self):
-        self.redis = StrictRedis()
-        self.work_queue = Queue(connection=self.redis)
-        self.work_queue.empty()
-        for key in self.redis.keys('rq:job:*'):
-            self.redis.delete(key)
+        work_queue.empty()
+        for key in redis.keys('rq:job:*'):
+            redis.delete(key)
 
-        slack_token = _config['SLACK'].get('token', '')
-        slack_channel = _config['SLACK'].get('channel', '')
-
-        if slack_token and slack_channel:
-            sonny_handler = SonnyHandler(self.redis, 'slack')
+        if SLACK_TOKEN and SLACK_CHANNEL:
+            sonny_handler = SonnyHandler(CLOUD)
             _logger.addHandler(sonny_handler)
         else:
             _logger.info('slack config missing')
 
-        _logger.info('sonny initialized')
+        db = redis_db()
+        _logger.info(f'monitor initialized on db {db}')
 
     @property
     def api_alive(self):
-        alive = self.get_db_value('api_alive', str)
-        alive_ts = self.get_db_value('api_alive:timestamp', float)
+        alive = redis_value('api_alive', str)
+        alive_ts = redis_value('api_alive:timestamp', float)
 
         return alive == 'True' and (time.time() - alive_ts) < 60
 
     @api_alive.setter
     def api_alive(self, alive=True):
-        self.redis.set('api_alive', alive)
+        redis.set('api_alive', alive)
         if alive:
-            self.redis.set('api_alive:timestamp', time.time())
+            redis.set('api_alive:timestamp', time.time())
 
     def run(self):
         def period_sleep(check_time):
             time.sleep(max(MONITOR_PERIOD - (time.time() - check_time), 0))
 
-        _logger.debug('sonny running')
+        _logger.info('monitor running')
         self.api_alive = True
 
         while True:
@@ -158,8 +165,6 @@ class Monitor:
                 _logger.warning(f'unknown issues within the worker')
 
     def handle_dead_hypervisors(self, dead_hvs):
-        _logger.info(f'handling dead hypervisors {dead_hvs}')
-
         dead_count = len(dead_hvs)
         if dead_count > DEAD_BACKOFF:
             if DEAD_BACKOFF == 0:
@@ -169,7 +174,7 @@ class Monitor:
             _logger.warning('not performing any action')
             return None, None
 
-        last_resurrection = self.get_db_value('resurrection:timestamp', float)
+        last_resurrection = redis_value('resurrection:timestamp', float)
         if last_resurrection and \
            time.time() - last_resurrection < COOLDOWN_PERIOD:
             _logger.warning('cooldown period still active')
@@ -182,14 +187,14 @@ class Monitor:
             spare_hv = self.get_spare_hypervisor(dead_hv, selected_hv_set)
             if spare_hv:
                 selected_hv_set.add(spare_hv)
-                _logger.info(f'resurrection job: {dead_hv} -> {spare_hv}')
+                _logger.info(f'resurrection started: {dead_hv} -> {spare_hv}')
                 job = self.resurrect_instances(dead_hv, spare_hv)
                 running_job[job.id] = job
             else:
                 _logger.warning(f'no spare hypervisors!')
                 return None, None
 
-        self.redis.set('resurrection:timestamp', time.time())
+        redis.set('resurrection:timestamp', time.time())
         success_count = failure_count = 0
         while running_job:
             time.sleep(2)
@@ -235,6 +240,7 @@ class Monitor:
                 _logger.info(f'no instances on {hv}')
                 continue
 
+            _logger.info(f'inspecting instances {instances_ip}')
             job = self.inspect_hosts(instances_ip, port_list=[22])
             job.hv = hv
             running_job[job.id] = job
@@ -257,18 +263,6 @@ class Monitor:
 
         return dead_hvs, alive_hvs
 
-    def get_db_value(self, key, value_type=None):
-        value = self.redis.get(key)
-
-        if value and value_type is str:
-            return value.decode('utf-8')
-        elif value and value_type:
-            return value_type(value)
-        elif value:
-            return value
-        else:
-            return None
-
     def wait_for_job(self, job, timeout=30):
         start_time = time.time()
         while not (job.is_finished or job.is_failed):
@@ -281,8 +275,8 @@ class Monitor:
     def get_suspicious_hypervisors(self):
         _logger.debug('checking for suspicious hypervisors')
         current_time = utcnow().timestamp()
-        agents = self.get_db_value('agents', json.loads)
-        hvs = self.get_db_value('hypervisors', json.loads)
+        agents = redis_value('agents', json.loads)
+        hvs = redis_value('hypervisors', json.loads)
         hypervisor_list = []
 
         for hv_name, agent_dict in agents.items():
@@ -324,7 +318,7 @@ class Monitor:
 
     def get_instances(self, hypervisor):
         _logger.debug(f'checking for affected instances on {hypervisor}')
-        servers = self.get_db_value('servers', json.loads)
+        servers = redis_value('servers', json.loads)
         instance_list = []
 
         for _, server in servers.items():
@@ -339,9 +333,9 @@ class Monitor:
     def get_spare_hypervisor(self, hv_down, ignore_set={}):
         _logger.info(f'getting spare hypervisor for {hv_down}')
 
-        services = self.get_db_value('services', json.loads)
-        aggregates = self.get_db_value('aggregates', json.loads)
-        hypervisors = self.get_db_value('hypervisors', json.loads)
+        services = redis_value('services', json.loads)
+        aggregates = redis_value('aggregates', json.loads)
+        hypervisors = redis_value('hypervisors', json.loads)
 
         hv_down_az = services[hv_down]['zone']
         hv_down_vcpus = hypervisors[hv_down]['vcpus']
@@ -380,17 +374,17 @@ class Monitor:
         return spare_hv
 
     def resurrect_instances(self, dead_hv, spare_hv):
-        return self.work_queue.enqueue(resurrect_instances, dead_hv, spare_hv)
+        return work_queue.enqueue(resurrect_instances, dead_hv, spare_hv)
 
     def inspect_hosts(self, hv_name_list, port_list=[22]):
-        return self.work_queue.enqueue(nmap_scan, hv_name_list, port_list)
+        return work_queue.enqueue(nmap_scan, hv_name_list, port_list)
 
     def refresh_redis_inventory(self, update_servers=False):
-        last_servers_update = self.get_db_value('servers:timestamp', float)
+        last_servers_update = redis_value('servers:timestamp', float)
         if not last_servers_update or time.time() - last_servers_update > 600:
             update_servers = True
 
-        return self.work_queue.enqueue(refresh_redis_inventory, update_servers)
+        return work_queue.enqueue(refresh_redis_inventory, update_servers)
 
 
 def parse_args(args):
@@ -425,14 +419,6 @@ def parse_args(args):
     return parser.parse_args(args)
 
 
-def read_and_validate_config(config_file='config.ini'):
-    _config.read(config_file)
-
-    for section in ['SLACK', 'REDIS', 'MYSQL', 'OPENSTACK']:
-        if section not in _config.sections():
-            raise Exception('config issue')
-
-
 def setup_logging(loglevel):
     """Setup basic logging
 
@@ -451,7 +437,6 @@ def main(args):
       args ([str]): command line parameter list
     """
     args = parse_args(args)
-    read_and_validate_config()
     setup_logging(args.loglevel)
     _logger.debug("starting sonny")
 

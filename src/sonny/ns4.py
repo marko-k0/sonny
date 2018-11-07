@@ -21,20 +21,29 @@
 from __future__ import division, print_function, absolute_import
 
 import argparse
-import configparser
 import json
 import re
 import sys
 import logging
 import time
 
-from sonny import __version__
-
 from nmap import PortScanner
 from openstack import connect, connection
 from pymysql import connect as mysql_connect, escape_string
-from redis import client, StrictRedis
-from rq import Connection, Worker
+from redis import client
+from rq import Worker
+
+from sonny import __version__
+from sonny.common.config import (
+    CLOUD,
+    MYSQL_HOST,
+    MYSQL_USER,
+    MYSQL_PASS
+)
+from sonny.common.redis import (
+    Redis,
+    redis_value
+)
 
 __author__ = "Marko Kosmerl"
 __copyright__ = "Marko Kosmerl"
@@ -42,21 +51,15 @@ __license__ = "gpl3"
 
 _logger = logging.getLogger(__name__)
 
-_config = configparser.ConfigParser()
-_config.read('config.ini')
-
 nm = PortScanner()
+os_connection = connect(CLOUD)
+redis = Redis(CLOUD)
 
-DB_HOST = _config['MYSQL'].get('host', None)
-DB_USER = _config['MYSQL'].get('user', None)
-DB_PASS = _config['MYSQL'].get('pass', None)
-
-OS_CLOUD = _config['OPENSTACK'].get('cloud')
-
-os_conn = connect(OS_CLOUD)
-redis = StrictRedis()
-
-assert isinstance(os_conn, connection.Connection)
+assert CLOUD is not None
+assert MYSQL_HOST is not None
+assert MYSQL_USER is not None
+assert MYSQL_PASS is not None
+assert isinstance(os_connection, connection.Connection)
 assert isinstance(redis, client.StrictRedis)
 
 
@@ -66,7 +69,7 @@ def nmap_scan(host_list, port_list=[22]):
 
     ip_to_hostname = {}
     host_ip_list = []
-    hvs_db = json.loads(redis.get('hypervisors'))
+    hvs_db = redis_value('hypervisors', json.loads)
 
     for host in host_list:
         if re.match(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$', host):
@@ -110,6 +113,7 @@ def refresh_redis_inventory(update_servers=False):
 
 
 def update_aggregates_db():
+    os_conn = connection.Connection(session=os_connection.session)
     aggregates_os = os_conn.list_aggregates()
     aggregates = {}
     for aggregate in aggregates_os:
@@ -121,6 +125,7 @@ def update_aggregates_db():
 
 
 def update_services_db():
+    os_conn = connection.Connection(session=os_connection.session)
     services_os = os_conn.compute.services()
     services = {
         s.host: s.to_dict() for s in services_os
@@ -132,6 +137,7 @@ def update_services_db():
 
 
 def update_projects_db():
+    os_conn = connection.Connection(session=os_connection.session)
     projects_os = os_conn.identity.projects()
     projects = {t.id: t.to_dict() for t in projects_os}
 
@@ -140,6 +146,7 @@ def update_projects_db():
 
 
 def update_hypervisors_db():
+    os_conn = connection.Connection(session=os_connection.session)
     hypervisors_os = os_conn.compute.hypervisors(True)
     hypervisors = {hv.name: hv.to_dict() for hv in hypervisors_os}
 
@@ -148,6 +155,7 @@ def update_hypervisors_db():
 
 
 def update_agents_db():
+    os_conn = connection.Connection(session=os_connection.session)
     agents_os = [
         (a.host, a.binary, a.last_heartbeat_at)
         for a in os_conn.network.agents()
@@ -161,6 +169,7 @@ def update_agents_db():
 
 
 def update_servers_db():
+    os_conn = connection.Connection(session=os_connection.session)
     servers_os = os_conn.compute.servers(all_tenants=True)
     servers = {}
 
@@ -171,12 +180,15 @@ def update_servers_db():
     redis.set('servers:timestamp', time.time())
 
 
+def reset_cooldown():
+    redis.delete('resurrection:timestamp')
+
+
 def resurrect_instances(dead_hv, spare_hv, update_db=True):
-    assert DB_HOST is not None
-    assert DB_USER is not None
-    assert DB_PASS is not None
+    # XXX: use nova api (evacuate --on-shared-storage)
     assert dead_hv != spare_hv
 
+    os_conn = connection.Connection(session=os_connection.session)
     dead_service = spare_service = None
     for svc in os_conn.compute.services():
         if svc.host == dead_hv:
@@ -193,8 +205,7 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
 
     if update_db:
         _logger.info('updating redis database')
-        refresh_redis_inventory()
-        update_servers_db()
+        refresh_redis_inventory(True)
 
     _logger.info(f'verifying that {dead_hv} is dead')
     if not nmap_scan([dead_hv], [22, 111, 16509]):
@@ -207,14 +218,15 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
             raise Exception(f'spare hypervisor {spare_hv} has vms assigned!')
         if server['hypervisor_hostname'] == dead_hv:
             instance_list.append(server['id'])
+            server['hypervisor_hostname'] = spare_hv
 
     if not instance_list:
         _logger.warning(f'{dead_hv} does not run any instances')
         return
 
-    _logger.info('updating database records')
+    _logger.info('updating database records in nova')
     db_conn = mysql_connect(
-        host=DB_HOST, user=DB_USER, passwd=DB_PASS, db='nova')
+        host=MYSQL_HOST, user=MYSQL_USER, passwd=MYSQL_PASS, db='nova')
     try:
         spare_hv = escape_string(spare_hv)
         with db_conn.cursor() as cursor:
@@ -231,7 +243,7 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
         db_conn.close()
 
     _logger.info('updating servers inventory db')
-    update_servers_db()
+    redis.set('servers', json.dumps(servers))
 
     _logger.info(f'disabling nova on {dead_hv}, enabling nova on {spare_hv}')
     os_conn.compute.disable_service(dead_service, dead_hv, 'nova-compute',
@@ -284,6 +296,11 @@ def parse_args(args):
     recover_group.add_argument(
         '-s',
         '--spare-hypervisor')
+    recover_group.add_argument(
+        '-r',
+        '--reset-cooldown',
+        action='store_true',
+        help='reset cooldown period')
 
     return parser.parse_args(args)
 
@@ -320,11 +337,12 @@ def main(args):
 
         return
 
+    if args.reset_cooldown:
+        reset_cooldown()
+        return
+
     _logger.debug("started monitor")
-    with Connection():
-        qs = ['default']
-        w = Worker(qs)
-        w.work()
+    Worker(['default'], connection=redis).work()
 
 
 def run():

@@ -18,48 +18,65 @@
 #    You should have received a copy of the GNU General Public License
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+from __future__ import division, print_function, absolute_import
+
 import argparse
-import configparser
 import re
 import sys
 import time
+from collections import deque
 
-from redis import StrictRedis
 from slackclient import SlackClient
 
 from sonny import __version__
+from sonny.common.config import (
+    CLOUDS,
+    SLACK_TOKEN,
+    SLACK_CHANNEL
+)
+from sonny.common.redis import (
+    Redis,
+    redis_value_show
+)
 
-_config = configparser.ConfigParser()
-_config.read('config.ini')
+assert SLACK_TOKEN is not None
+assert SLACK_CHANNEL is not None
+assert len(CLOUDS) > 0
 
-# constants
-RTM_READ_DELAY = 2  # x second delay between reading from RTM
-EXAMPLE_COMMAND = "do"
+RTM_READ_DELAY = 0.25
+COMMANDS = ['help', 'alive', 'show']
+EXAMPLE_COMMAND = "help"
 MENTION_REGEX = "^<@(|[WU].+?)>(.*)"
 
 
 class Sonny:
 
     def __init__(self):
-        token = _config['SLACK'].get('token')
-        channel = _config['SLACK'].get('channel')
-
-        self.slack_client = SlackClient(token)
-        self.redis = StrictRedis()
-        self.channel = channel
+        self.slack_client = SlackClient(SLACK_TOKEN)
+        self.channel = SLACK_CHANNEL
         self.starterbot_id = None
+
+        self._pubsub = {}
+        for cloud in CLOUDS:
+            self._pubsub[cloud] = Redis(cloud).pubsub(
+                ignore_subscribe_messages=True)
+            self._pubsub[cloud].subscribe([cloud])
+
+        self.message_queue = {cloud: deque() for cloud in CLOUDS}
+        self.message_queue['sonny'] = deque()
         self.last_post = time.time()
 
     def run(self):
         """
         ...
         """
-        self.pubsub = self.redis.pubsub(ignore_subscribe_messages=True)
-        self.pubsub.subscribe('slack')
 
         if self.slack_client.rtm_connect(with_team_state=False):
             self.starterbot_id = \
                 self.slack_client.api_call("auth.test")["user_id"]
+
+            self.post_message('sonny initialized')
+            self.post_message(f'subscribed to clouds {CLOUDS}')
 
             while True:
                 command, channel = self.parse_bot_commands(
@@ -67,10 +84,9 @@ class Sonny:
                 if command:
                     self.handle_command(command, channel)
 
-                message = self.pubsub.get_message()
-                if message:
-                    message_data = message['data'].decode('utf-8')
-                    self.post_message(message_data)
+                for _, pubsub in self._pubsub.items():
+                    message = pubsub.get_message()
+                    self.post_message(message)
 
                 time.sleep(RTM_READ_DELAY)
         else:
@@ -94,23 +110,46 @@ class Sonny:
         """
         Executes bot command if the command is known
         """
-        # Default response is help text for the user
-        default_response = "Not sure what you mean. Try *{}*.".format(
-            EXAMPLE_COMMAND)
+        default_response = f'not sure what you mean, try {COMMANDS}'
 
         response = None
-        if command.startswith(EXAMPLE_COMMAND):
-            response = "Sure...write some more code then I can do that!"
+        if command.startswith('help'):
+            response = f'cmds: {COMMANDS}'
+        elif command.startswith('show'):
+            response = redis_value_show(command)
+        elif command.startswith('alive'):
+            response = 'yes, but i do not know for monitor and ns4 robot'
 
-        # Sends the response back to the channel
         self.slack_client.api_call("chat.postMessage", channel=channel,
                                    text=response or default_response)
 
     def post_message(self, message):
-        # XXX: 1 post per second
+
+        if isinstance(message, str):
+            self.message_queue['sonny'].append(message)
+
+        elif isinstance(message, dict):
+            message_data = message['data'].decode('utf-8')
+            cloud = message['channel'].decode('utf-8')
+            self.message_queue[cloud].append(message_data)
+
+        time_now = time.time()
+        time_diff = time_now - self.last_post
+        if time_diff < 1:
+            return
+
+        m_list = []
+        for cloud in self.message_queue:
+            if self.message_queue[cloud]:
+                m = self.message_queue[cloud].popleft()
+                m_list.append(cloud + ': ' + m)
+
+        if not m_list:
+            return
 
         self.slack_client.api_call(
-            "chat.postMessage", channel=self.channel, text=message)
+            "chat.postMessage", channel=self.channel, text='\n'.join(m_list))
+        self.last_post = time.time()
 
     def parse_direct_mention(self, message_text):
         """
