@@ -28,7 +28,7 @@ import logging
 import time
 
 from nmap import PortScanner
-from openstack import connect, connection
+from openstack.connection import Connection as OpenStack
 from pymysql import connect as mysql_connect, escape_string
 from redis import client
 from rq import Worker
@@ -52,14 +52,14 @@ __license__ = "gpl3"
 _logger = logging.getLogger(__name__)
 
 nm = PortScanner()
-os_connection = connect(CLOUD)
+os = OpenStack(CLOUD)
 redis = Redis(CLOUD)
 
 assert CLOUD is not None
 assert MYSQL_HOST is not None
 assert MYSQL_USER is not None
 assert MYSQL_PASS is not None
-assert isinstance(os_connection, connection.Connection)
+assert isinstance(os, OpenStack)
 assert isinstance(redis, client.StrictRedis)
 
 
@@ -96,13 +96,16 @@ def nmap_scan(host_list, port_list=[22]):
 
 def refresh_redis_inventory(update_servers=False):
     try:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
         if update_servers:
-            update_servers_db()
-        update_hypervisors_db()
-        update_projects_db()
-        update_agents_db()
-        update_services_db()
-        update_aggregates_db()
+            update_servers_db(os_conn)
+        update_hypervisors_db(os_conn)
+        update_projects_db(os_conn)
+        update_agents_db(os_conn)
+        update_services_db(os_conn)
+        update_aggregates_db(os_conn)
     except Exception as e:
         redis.set('api_alive', False)
         _logger.error(str(e))
@@ -112,8 +115,11 @@ def refresh_redis_inventory(update_servers=False):
     redis.set('api_alive:timestamp', time.time())
 
 
-def update_aggregates_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_aggregates_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     aggregates_os = os_conn.list_aggregates()
     aggregates = {}
     for aggregate in aggregates_os:
@@ -124,8 +130,11 @@ def update_aggregates_db():
     redis.set('aggregates:timestamp', time.time())
 
 
-def update_services_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_services_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     services_os = os_conn.compute.services()
     services = {
         s.host: s.to_dict() for s in services_os
@@ -136,8 +145,11 @@ def update_services_db():
     redis.set('services:timestamp', time.time())
 
 
-def update_projects_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_projects_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     projects_os = os_conn.identity.projects()
     projects = {t.id: t.to_dict() for t in projects_os}
 
@@ -145,8 +157,11 @@ def update_projects_db():
     redis.set('projects:timestamp', time.time())
 
 
-def update_hypervisors_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_hypervisors_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     hypervisors_os = os_conn.compute.hypervisors(True)
     hypervisors = {hv.name: hv.to_dict() for hv in hypervisors_os}
 
@@ -154,8 +169,11 @@ def update_hypervisors_db():
     redis.set('hypervisors:timestamp', time.time())
 
 
-def update_agents_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_agents_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     agents_os = [
         (a.host, a.binary, a.last_heartbeat_at)
         for a in os_conn.network.agents()
@@ -168,8 +186,11 @@ def update_agents_db():
     redis.set('agents:timestamp', time.time())
 
 
-def update_servers_db():
-    os_conn = connection.Connection(session=os_connection.session)
+def update_servers_db(os_conn=None):
+    if not os_conn:
+        os_conn = OpenStack(
+            session=os.session, cloud=CLOUD, region_name=os.get_region())
+
     servers_os = os_conn.compute.servers(all_tenants=True)
     servers = {}
 
@@ -188,7 +209,8 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
     # XXX: use nova api (evacuate --on-shared-storage)
     assert dead_hv != spare_hv
 
-    os_conn = connection.Connection(session=os_connection.session)
+    os_conn = OpenStack(
+        session=os.session, cloud=CLOUD, region_name=os.get_region())
     dead_service = spare_service = None
     for svc in os_conn.compute.services():
         if svc.host == dead_hv:
