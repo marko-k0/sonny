@@ -120,7 +120,7 @@ def test_inspect_instances(monitor):
 
     monitor.get_instances = MagicMock()
     monitor.get_instances.return_value = instances
-    monitor.inspect_hosts.return_value.args = [ip for _, ip in instances]
+    monitor.inspect_hosts.return_value.args = ([ip for _, ip in instances], 22)
     for idx, ret in enumerate(inspect_returns):
         monitor.inspect_hosts.return_value.result = ret
 

@@ -245,7 +245,7 @@ class Monitor:
 
             for job_id, job in dict(running_job).items():
                 if job.is_finished:
-                    all_ips = job.args
+                    all_ips = job.args[0]
                     dead_ips = job.result
                     if len(dead_ips) == len(all_ips):
                         dead_hvs.append(job.hv)
