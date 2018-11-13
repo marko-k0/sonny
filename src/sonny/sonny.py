@@ -133,7 +133,7 @@ class Sonny:
         elif command.startswith('show'):
             cmds = command.split(' ')
             response = 'usage: show {hv name|vm {uuid|name}}'
-            if len(cmds) == 3 and any(cmds[1] == 'hv', cmds[1] == 'vm'):
+            if len(cmds) == 3 and any([cmds[1] == 'hv', cmds[1] == 'vm']):
                 for cloud in CLOUDS:
                     response = self._redis.show(command)
                     if response:
