@@ -27,64 +27,61 @@ import yaml
 from redis import StrictRedis
 
 from sonny.common.config import (
-    CLOUD,
-    CLOUDS,
     REDIS_HOST,
 )
 
 __author__ = "Marko Kosmerl"
 __copyright__ = "Marko Kosmerl"
 __license__ = "gpl3"
-__all__ = ['Redis', 'redis_db', 'redis_value']
-
-_redis = {}
 
 
-def Redis(cloud=CLOUD):
-    db = 0 if not cloud else redis_db(cloud)
-    return _redis.setdefault(db, StrictRedis(host=REDIS_HOST, db=db))
+class SonnyRedis(StrictRedis):
 
+    def __init__(self, cloud=None):
+        self.__set_db(cloud)
+        super().__init__(host=REDIS_HOST, db=self.db)
 
-def redis_db(cloud=CLOUD):
-    return int(hashlib.sha256(cloud.encode('utf-8')).hexdigest(), 16) % 15 + 1
+    @property
+    def db(self):
+        return self.__db
 
+    def __set_db(self, cloud=None):
+        if cloud:
+            self.__db = int(hashlib.sha256(
+                cloud.encode('utf-8')).hexdigest(), 16) % 15 + 1
+        else:
+            self.__db = 0
 
-def redis_value(key, value_type=None, cloud=CLOUD):
-    value = Redis(CLOUD).get(key)
+    def get(self, name, value_type=None):
+        value = super().get(name)
 
-    if value and value_type is str:
-        return value.decode('utf-8')
-    elif value and value_type:
-        return value_type(value)
-    elif value:
-        return value
-    else:
-        return None
+        if value and value_type is str:
+            return value.decode('utf-8')
+        elif value and value_type:
+            return value_type(value)
+        elif value:
+            return value
+        else:
+            return None
 
+    def show(self, command):
+        cmds = command.split(' ')
 
-def redis_value_show(command, cloud=None):
-    cmds = command.split(' ')
-    if len(cmds) != 3:
-        return 'usage: show {hv name|vm {uuid|name}}'
+        if cmds[1] == 'hv':
+            hv = cmds[2]
+            if hv.startswith('<') and hv.endswith('>') and '|' in hv:
+                hv = hv.strip('<>').split('|')[1]
 
-    clouds = [cloud] if cloud else CLOUDS
-
-    if cmds[1] == 'hv':
-        hv = cmds[2]
-        if hv.startswith('<'):
-            hv = hv.strip('<>').split('|')[1]
-
-        for cloud in clouds:
-            hvs = redis_value('hypervisors', json.loads, cloud)
+            hvs = self.get('hypervisors', json.loads)
             if hv in hvs:
                 return yaml.dump(hvs[hv])
-        return 'unknown hypervisor'
 
-    elif cmds[1] == 'vm':
-        vm = cmds[2]
-        for cloud in clouds:
-            vms = redis_value('servers', json.loads, cloud)
+        elif cmds[1] == 'vm':
+            vm = cmds[2]
+            vms = self.get('servers', json.loads)
+
             for uuid, v in vms.items():
                 if uuid == vm or v['name'] == vm:
                     return yaml.dump(v)
-        return 'unknown vm'
+
+        return None

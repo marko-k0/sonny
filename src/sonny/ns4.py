@@ -30,7 +30,6 @@ import time
 from nmap import PortScanner
 from openstack.connection import Connection as OpenStack
 from pymysql import connect as mysql_connect, escape_string
-from redis import client
 from rq import Worker
 
 from sonny import __version__
@@ -40,10 +39,7 @@ from sonny.common.config import (
     MYSQL_USER,
     MYSQL_PASS
 )
-from sonny.common.redis import (
-    Redis,
-    redis_value
-)
+from sonny.common.redis import SonnyRedis
 
 __author__ = "Marko Kosmerl"
 __copyright__ = "Marko Kosmerl"
@@ -53,14 +49,14 @@ _logger = logging.getLogger(__name__)
 
 nm = PortScanner()
 os = OpenStack(CLOUD)
-redis = Redis(CLOUD)
+redis = SonnyRedis(CLOUD)
 
 assert CLOUD is not None
 assert MYSQL_HOST is not None
 assert MYSQL_USER is not None
 assert MYSQL_PASS is not None
 assert isinstance(os, OpenStack)
-assert isinstance(redis, client.StrictRedis)
+assert isinstance(redis, SonnyRedis)
 
 
 def nmap_scan(host_list, port_list=[22]):
@@ -69,7 +65,7 @@ def nmap_scan(host_list, port_list=[22]):
 
     ip_to_hostname = {}
     host_ip_list = []
-    hvs_db = redis_value('hypervisors', json.loads)
+    hvs_db = redis.get('hypervisors', json.loads)
 
     for host in host_list:
         if re.match(r'^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$', host):

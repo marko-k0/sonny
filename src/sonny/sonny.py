@@ -24,9 +24,11 @@ import argparse
 import re
 import sys
 import time
+import traceback
 from collections import deque
 
 from slackclient import SlackClient
+from slackclient.server import SlackConnectionError
 
 from sonny import __version__
 from sonny.common.config import (
@@ -34,17 +36,14 @@ from sonny.common.config import (
     SLACK_TOKEN,
     SLACK_CHANNEL
 )
-from sonny.common.redis import (
-    Redis,
-    redis_value_show
-)
+from sonny.common.redis import SonnyRedis
 
 assert SLACK_TOKEN is not None
 assert SLACK_CHANNEL is not None
 assert len(CLOUDS) > 0
 
 RTM_READ_DELAY = 0.25
-COMMANDS = ['help', 'alive', 'show']
+COMMANDS = ['help', 'status', 'show']
 EXAMPLE_COMMAND = "help"
 MENTION_REGEX = "^<@(|[WU].+?)>(.*)"
 
@@ -56,9 +55,11 @@ class Sonny:
         self.channel = SLACK_CHANNEL
         self.starterbot_id = None
 
+        self._redis = {}
         self._pubsub = {}
         for cloud in CLOUDS:
-            self._pubsub[cloud] = Redis(cloud).pubsub(
+            self._redis[cloud] = redis = SonnyRedis(cloud)
+            self._pubsub[cloud] = redis.pubsub(
                 ignore_subscribe_messages=True)
             self._pubsub[cloud].subscribe([cloud])
 
@@ -68,29 +69,43 @@ class Sonny:
 
     def run(self):
         """
-        ...
+        Check for monitor messages and post them in slack channel.
+        Re-connect in case of connection errors.
         """
 
-        if self.slack_client.rtm_connect(with_team_state=False):
-            self.starterbot_id = \
-                self.slack_client.api_call("auth.test")["user_id"]
+        delay = 2
+        while True:
+            try:
+                if self.slack_client.rtm_connect(with_team_state=False):
+                    self.starterbot_id = \
+                        self.slack_client.api_call("auth.test")["user_id"]
 
-            self.post_message('sonny initialized')
-            self.post_message(f'subscribed to clouds {CLOUDS}')
+                    if delay == 2:
+                        self.post_message('sonny initialized')
+                        self.post_message(f'subscribed to clouds {CLOUDS}')
+                    else:
+                        self.post_message('sonny re-initialized')
 
-            while True:
-                command, channel = self.parse_bot_commands(
-                    self.slack_client.rtm_read())
-                if command:
-                    self.handle_command(command, channel)
+                    while True:
+                        command, channel = self.parse_bot_commands(
+                            self.slack_client.rtm_read())
+                        if command:
+                            self.handle_command(command, channel)
 
-                for _, pubsub in self._pubsub.items():
-                    message = pubsub.get_message()
-                    self.post_message(message)
+                        for _, pubsub in self._pubsub.items():
+                            message = pubsub.get_message()
+                            self.post_message(message)
 
-                time.sleep(RTM_READ_DELAY)
-        else:
-            print("Connection failed. Exception traceback printed above.")
+                        time.sleep(RTM_READ_DELAY)
+            except SlackConnectionError as e:
+                traceback.print_exc()
+                print(f'Connection error, reconnecting in {delay} seconds')
+            except Exception as e:
+                traceback.print_exc()
+                print(f'Connection exception, reconnecting in {delay} seconds')
+
+            time.sleep(delay)
+            delay *= delay
 
     def parse_bot_commands(self, slack_events):
         """
@@ -116,9 +131,28 @@ class Sonny:
         if command.startswith('help'):
             response = f'cmds: {COMMANDS}'
         elif command.startswith('show'):
-            response = redis_value_show(command)
-        elif command.startswith('alive'):
-            response = 'yes, but i do not know for monitor and ns4 robot'
+            cmds = command.split(' ')
+            response = 'usage: show {hv name|vm {uuid|name}}'
+            if len(cmds) == 3 and any(cmds[1] == 'hv', cmds[1] == 'vm'):
+                for cloud in CLOUDS:
+                    response = self._redis.show(command)
+                    if response:
+                        break
+                else:
+                    response = 'not found'
+        elif command.startswith('status'):
+            response = []
+            for cloud in CLOUDS:
+                last_run_ts = self._redis[cloud].get(
+                    'api_alive:timestamp', float)
+                if not last_run_ts:
+                    continue
+
+                last_run_d = int(time.time() - last_run_ts)
+                response.append(
+                    f'{cloud}: inventory updated {last_run_d} seconds ago')
+
+            response = '\n'.join(response)
 
         self.slack_client.api_call("chat.postMessage", channel=channel,
                                    text=response or default_response)
@@ -140,7 +174,7 @@ class Sonny:
 
         m_list = []
         for cloud in self.message_queue:
-            if self.message_queue[cloud]:
+            while self.message_queue[cloud]:
                 m = self.message_queue[cloud].popleft()
                 m_list.append(cloud + ': ' + m)
 

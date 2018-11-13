@@ -46,11 +46,7 @@ from sonny.common.config import (
     SLACK_TOKEN,
     SLACK_CHANNEL
 )
-from sonny.common.redis import (
-    Redis,
-    redis_db,
-    redis_value
-)
+from sonny.common.redis import SonnyRedis
 
 assert CLOUD is not None
 
@@ -60,7 +56,7 @@ utcnow = datetime.datetime.utcnow
 _logger = logging.getLogger(__name__)
 
 # REDIS
-redis = Redis(CLOUD)
+redis = SonnyRedis(CLOUD)
 work_queue = Queue(connection=redis)
 
 
@@ -88,13 +84,12 @@ class Monitor:
         else:
             _logger.info('slack config missing')
 
-        db = redis_db()
-        _logger.info(f'monitor initialized on db {db}')
+        _logger.info(f'monitor initialized on db {redis.db}')
 
     @property
     def api_alive(self):
-        alive = redis_value('api_alive', str)
-        alive_ts = redis_value('api_alive:timestamp', float)
+        alive = redis.get('api_alive', str)
+        alive_ts = redis.get('api_alive:timestamp', float)
 
         return alive == 'True' and (time.time() - alive_ts) < 60
 
@@ -174,7 +169,7 @@ class Monitor:
             _logger.warning('not performing any action')
             return None, None
 
-        last_resurrection = redis_value('resurrection:timestamp', float)
+        last_resurrection = redis.get('resurrection:timestamp', float)
         if last_resurrection and \
            time.time() - last_resurrection < COOLDOWN_PERIOD:
             _logger.warning('cooldown period still active')
@@ -250,7 +245,7 @@ class Monitor:
 
             for job_id, job in dict(running_job).items():
                 if job.is_finished:
-                    all_ips = job.args[0]
+                    all_ips = job.args
                     dead_ips = job.result
                     if len(dead_ips) == len(all_ips):
                         dead_hvs.append(job.hv)
@@ -275,8 +270,8 @@ class Monitor:
     def get_suspicious_hypervisors(self):
         _logger.debug('checking for suspicious hypervisors')
         current_time = utcnow().timestamp()
-        agents = redis_value('agents', json.loads)
-        hvs = redis_value('hypervisors', json.loads)
+        agents = redis.get('agents', json.loads)
+        hvs = redis.get('hypervisors', json.loads)
         hypervisor_list = []
 
         for hv_name, agent_dict in agents.items():
@@ -318,7 +313,7 @@ class Monitor:
 
     def get_instances(self, hypervisor):
         _logger.debug(f'checking for affected instances on {hypervisor}')
-        servers = redis_value('servers', json.loads)
+        servers = redis.get('servers', json.loads)
         instance_list = []
 
         for _, server in servers.items():
@@ -333,9 +328,9 @@ class Monitor:
     def get_spare_hypervisor(self, hv_down, ignore_set={}):
         _logger.info(f'getting spare hypervisor for {hv_down}')
 
-        services = redis_value('services', json.loads)
-        aggregates = redis_value('aggregates', json.loads)
-        hypervisors = redis_value('hypervisors', json.loads)
+        services = redis.get('services', json.loads)
+        aggregates = redis.get('aggregates', json.loads)
+        hypervisors = redis.get('hypervisors', json.loads)
 
         hv_down_az = services[hv_down]['zone']
         hv_down_vcpus = hypervisors[hv_down]['vcpus']
@@ -380,7 +375,7 @@ class Monitor:
         return work_queue.enqueue(nmap_scan, hv_name_list, port_list)
 
     def refresh_redis_inventory(self, update_servers=False):
-        last_servers_update = redis_value('servers:timestamp', float)
+        last_servers_update = redis.get('servers:timestamp', float)
         if not last_servers_update or time.time() - last_servers_update > 600:
             update_servers = True
 
