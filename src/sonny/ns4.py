@@ -201,12 +201,19 @@ def reset_cooldown():
     redis.delete('resurrection:timestamp')
 
 
+# XXX: use nova api (evacuate --on-shared-storage) & refactor
 def resurrect_instances(dead_hv, spare_hv, update_db=True):
-    # XXX: use nova api (evacuate --on-shared-storage)
     assert dead_hv != spare_hv
 
     os_conn = OpenStack(
         session=os.session, cloud=CLOUD, region_name=os.get_region())
+
+    if update_db:
+        _logger.info('updating redis database')
+        refresh_redis_inventory(True)
+
+    spare_hv_r = redis.get('hypervisors', json.loads)[spare_hv]
+    assert spare_hv_r['running_vms'] == 0
     dead_service = spare_service = None
     for svc in os_conn.compute.services():
         if svc.host == dead_hv:
@@ -220,10 +227,6 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
     assert spare_service.state == 'up'
     assert spare_service.zone == dead_service.zone
     assert 'spare' in spare_service.disables_reason.lower()
-
-    if update_db:
-        _logger.info('updating redis database')
-        refresh_redis_inventory(True)
 
     _logger.info(f'verifying that {dead_hv} is dead')
     if not nmap_scan([dead_hv], [22, 111, 16509]):
@@ -263,18 +266,31 @@ def resurrect_instances(dead_hv, spare_hv, update_db=True):
     _logger.info('updating servers inventory db')
     redis.set('servers', json.dumps(servers))
 
+    exceptions = []
+    for uuid in instance_list:
+        try:
+            if servers[uuid]['vm_state'] == 'stopped':
+                _logger.info(f'instance {uuid} is stoppped, not rebooting')
+                continue
+
+            _logger.info(f'hard rebooting instance {uuid}')
+            os_conn.compute.reboot_server(uuid, 'HARD')
+            for ifce in os_conn.compute.server_interfaces(uuid):
+                _logger.info(f'updating port binding on {ifce.port_id}')
+                port = os_conn.get_port(ifce.port_id)
+                if port:
+                    os_conn.network.update_port(
+                        port, **{'binding:host_id': spare_hv})
+        except Exception as e:
+            exceptions.append(str(e))
+
+    if exceptions:
+        raise Exception('\n'.join(exceptions))
+
     _logger.info(f'disabling nova on {dead_hv}, enabling nova on {spare_hv}')
     os_conn.compute.disable_service(dead_service, dead_hv, 'nova-compute',
                                     f'sonny resurrection on {spare_hv}')
     os_conn.compute.enable_service(spare_service, spare_hv, 'nova-compute')
-
-    for uuid in instance_list:
-        _logger.info(f'hard rebooting instance {uuid}')
-        os_conn.compute.reboot_server(uuid, 'HARD')
-        for ifce in os_conn.compute.server_interfaces(uuid):
-            _logger.info(f'updating port binding on {ifce.port_id}')
-            port = os_conn.get_port(ifce.port_id)
-            os_conn.network.update_port(port, **{'binding:host_id': spare_hv})
 
 
 def parse_args(args):

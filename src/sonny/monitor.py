@@ -23,6 +23,7 @@ from __future__ import division, print_function, absolute_import
 import argparse
 import datetime
 import json
+import signal
 import sys
 import logging
 import time
@@ -85,6 +86,12 @@ class Monitor:
             _logger.info('slack config missing')
 
         _logger.info(f'monitor initialized on db {redis.db}')
+        signal.signal(signal.SIGINT, self.signal_catch)
+        signal.signal(signal.SIGTERM, self.signal_catch)
+
+    def signal_catch(self, signum, frame):
+        _logger.warning('monitor terminating')
+        sys.exit()
 
     @property
     def api_alive(self):
@@ -157,7 +164,7 @@ class Monitor:
             if job.result:
                 _logger.warning(f'issues within the worker: {job.result}')
             else:
-                _logger.warning(f'unknown issues within the worker')
+                _logger.warning(f'unknown issues with ns4')
 
     def handle_dead_hypervisors(self, dead_hvs):
         dead_count = len(dead_hvs)
@@ -201,6 +208,7 @@ class Monitor:
                     del running_job[job.id]
                     success_count += 1
                 elif job.is_failed:
+                    job.refresh()
                     _logger.warning(f'failure: {dead_hv} -> {spare_hv}')
                     _logger.error(job.exc_info)
                     del running_job[job.id]

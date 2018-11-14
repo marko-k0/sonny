@@ -22,6 +22,7 @@ from __future__ import division, print_function, absolute_import
 
 import argparse
 import re
+import signal
 import sys
 import time
 import traceback
@@ -66,6 +67,12 @@ class Sonny:
         self.message_queue = {cloud: deque() for cloud in CLOUDS}
         self.message_queue['sonny'] = deque()
         self.last_post = time.time()
+        signal.signal(signal.SIGINT, self.signal_catch)
+        signal.signal(signal.SIGTERM, self.signal_catch)
+
+    def signal_catch(self, signum, frame):
+        self.post_message('terminating')
+        sys.exit()
 
     def run(self):
         """
@@ -135,7 +142,7 @@ class Sonny:
             response = 'usage: show {hv name|vm {uuid|name}}'
             if len(cmds) == 3 and any([cmds[1] == 'hv', cmds[1] == 'vm']):
                 for cloud in CLOUDS:
-                    response = self._redis.show(command)
+                    response = self._redis[cloud].show(command)
                     if response:
                         break
                 else:
