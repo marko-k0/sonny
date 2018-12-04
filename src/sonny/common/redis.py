@@ -28,6 +28,7 @@ from redis import StrictRedis
 
 from sonny.common.config import (
     REDIS_HOST,
+    REDIS_PASS
 )
 
 __author__ = "Marko Kosmerl"
@@ -39,7 +40,7 @@ class SonnyRedis(StrictRedis):
 
     def __init__(self, cloud=None):
         self.__set_db(cloud)
-        super().__init__(host=REDIS_HOST, db=self.db)
+        super().__init__(host=REDIS_HOST, db=self.db, password=REDIS_PASS)
 
     @property
     def db(self):

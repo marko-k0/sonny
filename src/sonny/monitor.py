@@ -44,6 +44,7 @@ from sonny.common.config import (
 )
 from sonny.common.config import (
     CLOUD,
+    EXT_NET_LIST,
     SLACK_TOKEN,
     SLACK_CHANNEL
 )
@@ -326,10 +327,11 @@ class Monitor:
 
         for _, server in servers.items():
             if server['hypervisor_hostname'] == hypervisor:
-                if 'ext-net' in server['addresses']:
-                    instance_name = server['name']
-                    instance_ip = server['addresses']['ext-net'][0]['addr']
-                    instance_list.append((instance_name, instance_ip))
+                for net in EXT_NET_LIST:
+                    if net in server['addresses']:
+                        instance_name = server['name']
+                        instance_ip = server['addresses']['ext-net'][0]['addr']
+                        instance_list.append((instance_name, instance_ip))
 
         return instance_list
 

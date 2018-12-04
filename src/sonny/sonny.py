@@ -25,7 +25,6 @@ import re
 import signal
 import sys
 import time
-import traceback
 from collections import deque
 
 from slackclient import SlackClient
@@ -80,19 +79,20 @@ class Sonny:
         Re-connect in case of connection errors.
         """
 
-        delay = 2
+        delay = 1
         while True:
             try:
                 if self.slack_client.rtm_connect(with_team_state=False):
                     self.starterbot_id = \
                         self.slack_client.api_call("auth.test")["user_id"]
 
-                    if delay == 2:
+                    if delay == 1:
                         self.post_message('sonny initialized')
                         self.post_message(f'subscribed to clouds {CLOUDS}')
                     else:
                         self.post_message('sonny re-initialized')
 
+                    delay = 2
                     while True:
                         command, channel = self.parse_bot_commands(
                             self.slack_client.rtm_read())
@@ -104,11 +104,9 @@ class Sonny:
                             self.post_message(message)
 
                         time.sleep(RTM_READ_DELAY)
-            except SlackConnectionError as e:
-                traceback.print_exc()
+            except SlackConnectionError:
                 print(f'Connection error, reconnecting in {delay} seconds')
-            except Exception as e:
-                traceback.print_exc()
+            except Exception:
                 print(f'Connection exception, reconnecting in {delay} seconds')
 
             time.sleep(delay)

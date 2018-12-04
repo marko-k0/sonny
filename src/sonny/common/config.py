@@ -49,6 +49,7 @@ DEAD_BACKOFF = int(config['DEFAULT'].get('dead_backoff', 1))
 
 # OPENSTACK
 CLOUD = config['OPENSTACK'].get('cloud')
+EXT_NET_LIST = config['OPENSTACK'].get('provider_net', 'ext-net').split(',')
 
 # MYSQL
 MYSQL_HOST = config['MYSQL'].get('host', None)
@@ -57,6 +58,7 @@ MYSQL_PASS = config['MYSQL'].get('pass', None)
 
 # REDIS
 REDIS_HOST = config['REDIS'].get('host')
+REDIS_PASS = config['REDIS'].get('pass', None)
 
 # SLACK
 SLACK_TOKEN = config['SLACK'].get('token', '')
