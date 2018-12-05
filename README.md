@@ -1,4 +1,4 @@
-# Sonny
+# Sonny [![Build Status](https://travis-ci.org/marko-k0/sonny.png?branch=master)](https://travis-ci.org/marko-k0/sonny)
 
 
 Sonny is a project providing automatic recovery for OpenStack instances from compute nodes that experience hardware failure. It takes care that your pet instances become available when inevitable hardware failure happens. _Sonny only works with CEPH being used as a beckend for emphemeral disks and Cinder volumes._
