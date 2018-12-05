@@ -24,9 +24,11 @@ from unittest.mock import MagicMock, patch
 import json
 import pytest
 import time
+import sys
 
-import sonny.monitor
-from .fakesonnyredis import FakeSonnyRedis
+sys.modules['openstack.connection'] = MagicMock()
+import sonny.monitor # noqa
+from .fakesonnyredis import FakeSonnyRedis # noqa
 
 __author__ = "Marko Kosmerl"
 __copyright__ = "Marko Kosmerl"

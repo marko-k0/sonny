@@ -55,8 +55,6 @@ assert CLOUD is not None
 assert MYSQL_HOST is not None
 assert MYSQL_USER is not None
 assert MYSQL_PASS is not None
-assert isinstance(os, OpenStack)
-assert isinstance(redis, SonnyRedis)
 
 
 def nmap_scan(host_list, port_list=[22]):
