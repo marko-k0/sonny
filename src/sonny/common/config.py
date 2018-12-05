@@ -63,6 +63,7 @@ REDIS_PASS = config['REDIS'].get('pass', None)
 # SLACK
 SLACK_TOKEN = config['SLACK'].get('token', '')
 SLACK_CHANNEL = config['SLACK'].get('channel', '')
-CLOUDS = config['SLACK'].get('clouds').split(',')
+CLOUDS = config['SLACK'].get('clouds')
+CLOUDS = CLOUDS.split(',') if CLOUDS else []
 
 assert REDIS_HOST is not None
