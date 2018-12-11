@@ -47,6 +47,7 @@ def monitor():
         monitor.redis = sonny.monitor.redis
         monitor.redis.flushall()
         monitor.api_alive = True
+        monitor.last_run_backed_off = 0
 
         monitor.wait_for_job = MagicMock(return_value=True)
 

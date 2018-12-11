@@ -90,7 +90,7 @@ class Sonny:
                         self.post_message('sonny initialized')
                         self.post_message(f'subscribed to clouds {CLOUDS}')
                     else:
-                        self.post_message('sonny re-initialized')
+                        self.handle_command('status', self.channel)
 
                     delay = 2
                     while True:

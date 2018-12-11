@@ -90,6 +90,8 @@ class Monitor:
         signal.signal(signal.SIGINT, self.signal_catch)
         signal.signal(signal.SIGTERM, self.signal_catch)
 
+        self.last_run_backed_off = 0
+
     def signal_catch(self, signum, frame):
         _logger.warning('monitor terminating')
         sys.exit()
@@ -136,8 +138,14 @@ class Monitor:
 
             s_hvs = self.get_suspicious_hypervisors()
             if s_hvs:
+                backoff = len(s_hvs) > SUSPICIOUS_BACKOFF
+                if backoff and self.last_run_backed_off:
+                    self.last_run_backed_off += 1
+                    return
+
                 _logger.warning(f'suspicious hypervisors: {s_hvs}')
-                if len(s_hvs) > SUSPICIOUS_BACKOFF:
+                if backoff:
+                    self.last_run_backed_off += 1
                     _logger.warning(
                         'too many suspicious hypervisors, backing off')
                     return
@@ -160,7 +168,13 @@ class Monitor:
                 else:
                     _logger.info('tcp scan check shows hypervisors are ok')
             else:
-                _logger.debug('no suspicious hypervisors')
+                if self.last_run_backed_off:
+                    n = self.last_run_backed_off
+                    _logger.info('no suspicious hypervisors')
+                    _logger.info(f'backed off {n} times')
+                    self.last_run_backed_off = 0
+                else:
+                    _logger.debug('no suspicious hypervisors')
         elif not self.api_alive:
             if job.result:
                 _logger.warning(f'issues within the worker: {job.result}')
@@ -312,7 +326,7 @@ class Monitor:
 
             if all([(current_time - t) > HEARTBEAT_PERIOD for t in ts_list]):
                 hypervisor_list.append(hv_name)
-                _logger.info(f'hypervisor {hv_name} is suspicious')
+                _logger.debug(f'hypervisor {hv_name} is suspicious')
                 for a, t in agent_dict.items():
                     tt = strptime(t, "%Y-%m-%d %H:%M:%S").timestamp()
                     tt_d = int(current_time - tt)
