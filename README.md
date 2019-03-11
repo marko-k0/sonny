@@ -77,11 +77,9 @@ OpenStack project [Masakari](https://github.com/openstack/masakari) exists that 
 # TODO
 
 - [x] Beta version.
-- [ ] Add Supervisord and Ansible deployment.
-- [ ] Detect that access switch of HV is OK.
-- [ ] Make Sonny be able to use Telegram.
+- [ ] Dockerize.
 - [ ] HA version.
-- [ ] Make Sonny smarter for conversation.
+- [ ] Chatbot.
 
 # License
 

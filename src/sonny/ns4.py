@@ -101,11 +101,11 @@ def refresh_redis_inventory(update_servers=False):
         update_services_db(os_conn)
         update_aggregates_db(os_conn)
     except Exception as e:
-        redis.set('api_alive', False)
+        redis.set('api_alive', 0)
         _logger.error(str(e))
         raise e
 
-    redis.set('api_alive', True)
+    redis.set('api_alive', 1)
     redis.set('api_alive:timestamp', time.time())
 
 

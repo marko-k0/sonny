@@ -46,7 +46,7 @@ def monitor():
 
         monitor.redis = sonny.monitor.redis
         monitor.redis.flushall()
-        monitor.api_alive = True
+        monitor.api_alive = 1
         monitor.last_run_backed_off = 0
 
         monitor.wait_for_job = MagicMock(return_value=True)
@@ -78,13 +78,6 @@ def test_db_value(monitor):
     assert monitor.redis.get('string', str) == 'string'
     assert monitor.redis.get('dict', json.loads) == {'test': 1}
     assert monitor.redis.get('list', json.loads) == ['test']
-
-
-def test_api_alive(monitor):
-    monitor.api_alive = False
-    assert monitor.api_alive is False
-    monitor.api_alive = True
-    assert monitor.api_alive is True
 
 
 def test_get_instances(monitor):
