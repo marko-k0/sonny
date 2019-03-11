@@ -98,13 +98,13 @@ class Monitor:
 
     @property
     def api_alive(self):
-        alive = redis.get('api_alive', str)
+        alive = redis.get('api_alive', int)
         alive_ts = redis.get('api_alive:timestamp', float)
 
-        return alive == 'True' and (time.time() - alive_ts) < 60
+        return int(alive == 1 and (time.time() - alive_ts) < 60)
 
     @api_alive.setter
-    def api_alive(self, alive=True):
+    def api_alive(self, alive=1):
         redis.set('api_alive', alive)
         if alive:
             redis.set('api_alive:timestamp', time.time())
@@ -114,7 +114,7 @@ class Monitor:
             time.sleep(max(MONITOR_PERIOD - (time.time() - check_time), 0))
 
         _logger.info('monitor running')
-        self.api_alive = True
+        self.api_alive = 1
 
         while True:
             check_time = time.time()

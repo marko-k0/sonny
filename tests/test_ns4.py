@@ -20,6 +20,7 @@
 
 from unittest.mock import MagicMock
 
+import json
 import pytest
 
 import sonny.ns4 as ns4
@@ -45,7 +46,7 @@ def test_refresh_redis_inventory():
     with pytest.raises(Exception):
         ns4.refresh_redis_inventory()
 
-    assert ns4.redis.get('api_alive') == b'False'
+    assert ns4.redis.get('api_alive') == b'0'
 
 
 def test_nmap_scan_up():
@@ -71,7 +72,7 @@ def test_nmap_scan_up():
                                                'conf': '10',
                                                'cpe': 'cpe:/a:openssh:7.4'}}}}}
 
-    ns4.redis.set('hypervisors', {})
+    ns4.redis.set('hypervisors', json.dumps({}).encode('utf-8'))
     ns4.nm.scan = MagicMock()
     ns4.nm.scan.return_value = output
     result = ns4.nmap_scan([input])
@@ -92,7 +93,7 @@ def test_nmap_scan_down():
                                 'totalhosts': '1'}},
          'scan': {}}
 
-    ns4.redis.set('hypervisors', {})
+    ns4.redis.set('hypervisors', json.dumps({}).encode('utf-8'))
     ns4.nm.scan = MagicMock()
     ns4.nm.scan.return_value = output
     result = ns4.nmap_scan([input])
