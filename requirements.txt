@@ -1,5 +1,5 @@
 fakeredis
-redis
+redis==3.1.0
 rq
 rq-scheduler
 python-nmap
